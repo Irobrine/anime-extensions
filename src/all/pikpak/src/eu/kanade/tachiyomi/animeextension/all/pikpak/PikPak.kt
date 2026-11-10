@@ -31,6 +31,7 @@ import keiyoushi.network.head
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -80,6 +81,12 @@ abstract class PikPak :
     private var validatedAccount: String? = null
 
     private val libraryCache = ConcurrentHashMap<String, Pair<Library, Long>>()
+
+    @Volatile
+    private var directClientAccount: String? = null
+
+    @Volatile
+    private var directClient: PikPakClient? = null
 
     // ============================== Popular ===============================
 
@@ -400,15 +407,19 @@ abstract class PikPak :
             if (expiresAt > now) return library
         }
 
-        val torz = torzLibrary(catalogId)
-        val library = torz?.takeIf { it.entries.any { entry -> entry.season != null } }
-            ?: metaLibrary(catalogId)
+        val direct = directLibrary(catalogId)
+        val torz = if (direct?.entries?.isNotEmpty() == true) null else torzLibrary(catalogId)
+        val library = direct?.takeIf { it.entries.isNotEmpty() }
             ?: torz?.takeIf { it.entries.isNotEmpty() }
+            ?: metaLibrary(catalogId)
+            ?: direct
+            ?: torz
 
         Log.d(
             TAG,
-            "library catalog=$catalogId webdl=${isWebDl(catalogId)} torzEntries=${torz?.entries?.size} " +
-                "torzSeasons=${torz?.entries?.mapNotNull { it.season }?.distinct()} " +
+            "library catalog=$catalogId webdl=${isWebDl(catalogId)} directEntries=${direct?.entries?.size} " +
+                "directSeasons=${direct?.entries?.mapNotNull { it.season }?.distinct()} " +
+                "torzEntries=${torz?.entries?.size} torzSeasons=${torz?.entries?.mapNotNull { it.season }?.distinct()} " +
                 "used=entries:${library?.entries?.size} seasons:${library?.entries?.mapNotNull { it.season }?.distinct()}",
         )
         if (library != null) {
@@ -416,6 +427,67 @@ abstract class PikPak :
         }
         return library
     }
+
+    private suspend fun directLibrary(catalogId: String): Library? {
+        val itemId = catalogItemId(catalogId) ?: return null
+        val client = directClient() ?: return null
+
+        val listing = try {
+            client.list(itemId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "direct failed item=$itemId error=${e.message}")
+            null
+        } ?: return null
+
+        val entries = listing.files
+            .filter { file -> isVideoFile(file.name.ifBlank { file.path.substringAfterLast('/') }) }
+            .map { file ->
+                val fileName = file.name.ifBlank { file.path.substringAfterLast('/') }
+                EpisodeEntry(
+                    fileName = fileName,
+                    streamId = "$catalogId:${encodePathSegment(lockedLink(listing.rootId, file.id))}",
+                    season = pathSeasonKey(listing.name, file.path, fileName),
+                    episode = parseEpisodeNumber(fileName),
+                    released = file.createdTime,
+                    thumbnail = file.thumbnailLink,
+                )
+            }
+
+        val finalEntries = withOtherSeason(entries)
+        Log.d(
+            TAG,
+            "direct item=$itemId files=${listing.files.size} videos=${finalEntries.size} " +
+                "seasons=${finalEntries.mapNotNull { it.season }.distinct()}",
+        )
+        return Library(listing.name, finalEntries)
+    }
+
+    @Synchronized
+    private fun directClient(): PikPakClient? {
+        val account = account()
+        directClient?.takeIf { directClientAccount == account }?.let { return it }
+
+        val parts = account.split(':', limit = 2)
+        if (parts.size < 2 || parts[1].isBlank()) return null
+
+        return PikPakClient(client, parts[0], parts[1]).also {
+            directClient = it
+            directClientAccount = account
+        }
+    }
+
+    private fun catalogItemId(catalogId: String): String? = when {
+        catalogId.startsWith("$CATALOG_TORRENTS:") -> catalogId.removePrefix("$CATALOG_TORRENTS:")
+        catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> catalogId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
+        else -> null
+    }?.takeIf { it.isNotBlank() }
+
+    private fun lockedLink(rootId: String, fileId: String): String = "stremthru://store/pikpak/" + Base64.encodeToString(
+        "$rootId:$fileId".toByteArray(Charsets.UTF_8),
+        Base64.NO_WRAP,
+    )
 
     private suspend fun torzLibrary(catalogId: String): Library? {
         val data = fetchTorz(catalogId) ?: return null
@@ -431,7 +503,7 @@ abstract class PikPak :
                     episode = parseEpisodeNumber(fileName),
                 )
             }
-        return Library(data.name, entries)
+        return Library(data.name, withOtherSeason(entries))
     }
 
     private suspend fun metaLibrary(catalogId: String): Library? {
@@ -447,30 +519,43 @@ abstract class PikPak :
                 thumbnail = video.thumbnail,
             )
         }
-        return Library(meta.name, entries)
+        return Library(meta.name, withOtherSeason(entries))
     }
 
     private fun isWebDl(catalogId: String): Boolean = catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:")
 
-    private fun torzSeasonKey(itemName: String, file: TorzFile): String? {
-        val path = file.path.replace('\\', '/').trim('/').ifBlank { file.name }
+    private fun withOtherSeason(entries: List<EpisodeEntry>): List<EpisodeEntry> {
+        if (entries.none { it.season != null }) return entries
+        return entries.map { entry ->
+            if (entry.season == null) entry.copy(season = OTHER_SEASON) else entry
+        }
+    }
+
+    private fun torzSeasonKey(itemName: String, file: TorzFile): String? = pathSeasonKey(itemName, file.path, file.name)
+
+    private fun pathSeasonKey(itemName: String, rawPath: String, fallbackName: String): String? {
+        val path = rawPath.replace('\\', '/').trim('/').ifBlank { fallbackName }
         val segments = path.split('/').map { it.trim() }.filter { it.isNotBlank() }
         if (segments.size < 2) return null
 
-        val first = segments[0]
-        val firstClean = cleanAnimeName(first).lowercase(Locale.US)
+        val folders = segments.dropLast(1).toMutableList()
         val itemClean = cleanAnimeName(itemName).lowercase(Locale.US)
-        val firstLooksLikeSeason = seasonSortKey(first) != Int.MAX_VALUE
-        val isItemFolder = firstClean == itemClean ||
-            (!firstLooksLikeSeason && firstClean.length >= 3 && itemClean.startsWith(firstClean))
 
-        val season = if (isItemFolder) {
-            segments.getOrNull(1)?.takeIf { segments.size >= 3 }
-        } else {
-            first
+        while (folders.isNotEmpty()) {
+            val first = folders[0]
+            val firstClean = cleanAnimeName(first).lowercase(Locale.US)
+            val firstLooksLikeSeason = seasonSortKey(first) != Int.MAX_VALUE
+            val isItemFolder = firstClean == itemClean ||
+                (!firstLooksLikeSeason && firstClean.length >= 3 && itemClean.startsWith(firstClean))
+            if (!isItemFolder) break
+            folders.removeAt(0)
         }
-        if (season == null && segments.size > 1) {
-            Log.d(TAG, "no season path=${file.path} item=$itemName segments=$segments")
+
+        val season = folders.firstOrNull { seasonSortKey(it) != Int.MAX_VALUE }
+            ?: folders.firstOrNull { !isVideoTypeTag(it) }
+
+        if (season == null && folders.isNotEmpty()) {
+            Log.d(TAG, "no season path=$rawPath fallback=$fallbackName item=$itemName folders=$folders")
         }
         return season
     }
@@ -642,6 +727,7 @@ abstract class PikPak :
         private const val CATALOG_WEB_DOWNLOADS = "st:store:pp-webdl"
 
         private const val SEASON_SEPARATOR = "|"
+        private const val OTHER_SEASON = "Other"
 
         private val SEASON_EPISODE_REGEX = Regex("(?i)S(\\d{1,2})[\\s._-]*E(\\d{1,4})")
         private val SEASON_NAME_REGEX = Regex("(?i)Season\\s*(\\d{1,2})")
