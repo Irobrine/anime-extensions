@@ -231,15 +231,19 @@ abstract class PikPak :
         val details = runCatching { episode.url.parseAs<PikPakEpisodeUrl>() }
             .getOrElse { PikPakEpisodeUrl(fileId = null, streamId = episode.url) }
 
-        val directUrl = details.fileId?.let { fileId ->
-            try {
-                directClient()?.getStreamUrl(fileId)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.d(TAG, "direct stream failed file=$fileId error=${e.message}")
-                null
+        val directUrl = if (preferences.getBoolean(PREF_DIRECT_KEY, true)) {
+            details.fileId?.let { fileId ->
+                try {
+                    directClient()?.getStreamUrl(fileId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.d(TAG, "direct stream failed file=$fileId error=${e.message}")
+                    null
+                }
             }
+        } else {
+            null
         }
 
         if (directUrl != null) {
@@ -460,6 +464,8 @@ abstract class PikPak :
     }
 
     private suspend fun directLibrary(catalogId: String): Library? {
+        if (!preferences.getBoolean(PREF_DIRECT_KEY, true)) return null
+
         val itemId = catalogItemId(catalogId) ?: return null
         val client = directClient() ?: return null
 
@@ -756,6 +762,16 @@ abstract class PikPak :
         }.also(screen::addPreference)
 
         SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DIRECT_KEY
+            title = "Direct PikPak connection"
+            summary = "List folders and generate playback links directly from PikPak. Turn off to use only StremThru."
+            setDefaultValue(true)
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit().putBoolean(key, newValue as Boolean).commit()
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
             key = PREF_TORRENTS_KEY
             title = "Show torrent downloads"
             summary = "Items in My Pack that were added from magnet links."
@@ -796,6 +812,7 @@ abstract class PikPak :
         private const val STORE_NAME = "pikpak"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
+        private const val PREF_DIRECT_KEY = "direct_pikpak"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
 
