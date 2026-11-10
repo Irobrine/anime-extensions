@@ -59,7 +59,10 @@ abstract class PikPak :
 
     override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage = catalogPage(myPack(), page)
+    override suspend fun getPopularAnime(page: Int): AnimesPage {
+        Log.d(TAG, "popular page=$page build=$BUILD_TAG")
+        return catalogPage(myPack(), page)
+    }
 
     // =============================== Latest ===============================
 
@@ -78,6 +81,7 @@ abstract class PikPak :
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         if (query.isBlank()) return getPopularAnime(page)
 
+        Log.d(TAG, "search page=$page query=$query")
         val filtered = myPack().filter { it.name.contains(query, ignoreCase = true) }
         return catalogPage(filtered, page)
     }
@@ -87,6 +91,7 @@ abstract class PikPak :
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        Log.d(TAG, "details start url=${anime.url} build=$BUILD_TAG")
         val (itemId, season) = parseSeasonUrl(anime.url)
         if (season != null) {
             anime.fetch_type = FetchType.Episodes
@@ -110,6 +115,7 @@ abstract class PikPak :
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
     override suspend fun getSeasonList(anime: SAnime): List<SAnime> {
+        Log.d(TAG, "season list start url=${anime.url} build=$BUILD_TAG")
         val (itemId, season) = parseSeasonUrl(anime.url)
         if (season != null) return emptyList()
 
@@ -143,6 +149,7 @@ abstract class PikPak :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        Log.d(TAG, "episode list start url=${anime.url} build=$BUILD_TAG")
         val (itemId, seasonFilter) = parseSeasonUrl(anime.url)
         val library = libraryFor(itemId)
 
@@ -235,6 +242,7 @@ abstract class PikPak :
             throw IOException("Could not list PikPak My Pack: ${e.message}", e)
         }
 
+        Log.d(TAG, "my pack items=${items.size} build=$BUILD_TAG")
         catalogCache[key] = items to (now + CATALOG_CACHE_MS)
         return filterCatalog(items)
     }
@@ -264,9 +272,9 @@ abstract class PikPak :
                 title = cleanAnimeName(item.name).ifBlank { item.id }
                 url = item.id
                 description = if (item.params?.url?.startsWith("magnet:", ignoreCase = true) == true) {
-                    "PikPak torrent"
+                    "PikPak torrent • $BUILD_TAG"
                 } else {
-                    "PikPak file"
+                    "PikPak file • $BUILD_TAG"
                 }
                 thumbnail_url = item.thumbnailLink?.takeIf { it.isNotBlank() } ?: FALLBACK_POSTER
             }
@@ -568,6 +576,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
+        private const val BUILD_TAG = "direct-v2"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_TORRENTS_KEY = "show_torrents"
