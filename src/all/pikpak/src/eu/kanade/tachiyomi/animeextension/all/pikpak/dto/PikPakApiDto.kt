@@ -69,9 +69,28 @@ data class PikPakFile(
     val trashed: Boolean? = null,
     @SerialName("created_time") val createdTime: String? = null,
     @SerialName("thumbnail_link") val thumbnailLink: String? = null,
+    @SerialName("web_content_link") val webContentLink: String? = null,
+    val medias: List<PikPakMedia>? = null,
     val params: PikPakFileParams? = null,
     val error: String? = null,
     @SerialName("error_description") val errorDescription: String? = null,
+)
+
+@Serializable
+data class PikPakMedia(
+    @SerialName("media_name") val mediaName: String? = null,
+    val link: PikPakMediaLink? = null,
+    @SerialName("is_default") val isDefault: Boolean = false,
+    @SerialName("is_origin") val isOrigin: Boolean = false,
+    @SerialName("resolution_name") val resolutionName: String? = null,
+)
+
+@Serializable
+data class PikPakMediaLink(
+    val url: String? = null,
+    val token: String? = null,
+    val expire: String? = null,
+    val type: String? = null,
 )
 
 @Serializable

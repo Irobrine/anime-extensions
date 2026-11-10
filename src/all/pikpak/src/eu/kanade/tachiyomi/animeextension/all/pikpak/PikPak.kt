@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.CatalogResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.Meta
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaVideo
+import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakEpisodeUrl
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StreamResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StremThruUserData
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.TorzData
@@ -215,7 +216,7 @@ abstract class PikPak :
                 SEpisode.create().apply {
                     episode_number = episode.toFloat()
                     name = formatEpisode(episode)
-                    url = entry.streamId
+                    url = json.encodeToString(PikPakEpisodeUrl(entry.fileId, entry.streamId))
                     date_upload = parseDate(entry.released)
                     preview_url = entry.thumbnail.orEmpty()
                 }
@@ -227,9 +228,33 @@ abstract class PikPak :
     override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        val details = runCatching { episode.url.parseAs<PikPakEpisodeUrl>() }
+            .getOrElse { PikPakEpisodeUrl(fileId = null, streamId = episode.url) }
+
+        val directUrl = details.fileId?.let { fileId ->
+            try {
+                directClient()?.getStreamUrl(fileId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.d(TAG, "direct stream failed file=$fileId error=${e.message}")
+                null
+            }
+        }
+
+        if (directUrl != null) {
+            Log.d(TAG, "direct stream file=${details.fileId} ok")
+            return listOf(
+                Video(
+                    videoUrl = directUrl,
+                    videoTitle = episode.name,
+                ),
+            ).toHosterList()
+        }
+
         validateAccount()
         val streams = client.get(
-            apiUrl("stream", "other", "${episode.url}.json"),
+            apiUrl("stream", "other", "${details.streamId}.json"),
             cacheControl = CacheControl.FORCE_NETWORK,
         ).parseAs<StreamResponse>().streams.orEmpty()
 
@@ -450,6 +475,7 @@ abstract class PikPak :
                     streamId = "$catalogId:${encodePathSegment(lockedLink(listing.rootId, file.id))}",
                     season = pathSeasonKey(listing.name, file.path, fileName),
                     episode = parseEpisodeNumber(fileName),
+                    fileId = file.id,
                     released = file.createdTime,
                     thumbnail = file.thumbnailLink,
                 )
@@ -489,6 +515,47 @@ abstract class PikPak :
         Base64.NO_WRAP,
     )
 
+    private fun fileIdFromLockedLink(link: String): String? {
+        val encoded = link.removePrefix("stremthru://store/pikpak/")
+        if (encoded == link || encoded.isBlank()) return null
+
+        return runCatching {
+            String(Base64.decode(encoded, Base64.NO_WRAP), Charsets.UTF_8)
+        }.getOrNull()
+            ?.substringAfter(':', "")
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun fileIdFromStreamId(streamId: String): String? {
+        val afterPrefix = when {
+            streamId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> streamId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
+            streamId.startsWith("$CATALOG_TORRENTS:") -> streamId.removePrefix("$CATALOG_TORRENTS:")
+            else -> return null
+        }
+        val escapedLink = afterPrefix.substringAfter(':', "")
+        if (escapedLink.isBlank()) return null
+        return fileIdFromLockedLink(percentDecode(escapedLink))
+    }
+
+    private fun percentDecode(value: String): String {
+        val bytes = java.io.ByteArrayOutputStream()
+        var index = 0
+        while (index < value.length) {
+            val char = value[index]
+            if (char == '%' && index + 2 < value.length) {
+                val hex = value.substring(index + 1, index + 3).toIntOrNull(16)
+                if (hex != null) {
+                    bytes.write(hex)
+                    index += 3
+                    continue
+                }
+            }
+            bytes.write(char.code)
+            index++
+        }
+        return bytes.toByteArray().toString(Charsets.UTF_8)
+    }
+
     private suspend fun torzLibrary(catalogId: String): Library? {
         val data = fetchTorz(catalogId) ?: return null
         val itemName = data.name.ifBlank { catalogId.substringAfterLast(':') }
@@ -501,6 +568,7 @@ abstract class PikPak :
                     streamId = "$catalogId:${encodePathSegment(file.link)}",
                     season = torzSeasonKey(itemName, file),
                     episode = parseEpisodeNumber(fileName),
+                    fileId = fileIdFromLockedLink(file.link),
                 )
             }
         return Library(data.name, withOtherSeason(entries))
@@ -515,6 +583,7 @@ abstract class PikPak :
                 streamId = video.id,
                 season = seasonKey(video),
                 episode = parseEpisodeNumber(fileName) ?: video.episode,
+                fileId = fileIdFromStreamId(video.id),
                 released = video.released,
                 thumbnail = video.thumbnail,
             )
@@ -711,6 +780,7 @@ abstract class PikPak :
         val streamId: String,
         val season: String?,
         val episode: Int?,
+        val fileId: String? = null,
         val released: String? = null,
         val thumbnail: String? = null,
     )

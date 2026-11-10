@@ -87,3 +87,9 @@ data class TorzFile(
     val path: String = "",
     val size: Long? = null,
 )
+
+@Serializable
+data class PikPakEpisodeUrl(
+    val fileId: String? = null,
+    val streamId: String,
+)

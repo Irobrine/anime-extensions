@@ -6,6 +6,7 @@ import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakCaptchaRequest
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakCaptchaResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFile
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFileListResponse
+import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakMedia
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakRefreshRequest
 import keiyoushi.network.get
 import keiyoushi.network.post
@@ -90,6 +91,21 @@ internal class PikPakClient(
         }
 
         Listing(root.name, root.id, files)
+    }
+
+    suspend fun getStreamUrl(fileId: String): String? = mutex.withLock {
+        ensureAuthLocked()
+        val file = getFileLocked(fileId)
+
+        val media = file.medias.orEmpty()
+            .filter { it.link?.url?.isNotBlank() == true }
+            .maxWithOrNull(
+                compareBy<PikPakMedia> { it.isDefault }
+                    .thenBy { it.isOrigin },
+            )
+
+        media?.link?.url?.takeIf { it.isNotBlank() }
+            ?: file.webContentLink?.takeIf { it.isNotBlank() }
     }
 
     private suspend fun listRecursiveLocked(
