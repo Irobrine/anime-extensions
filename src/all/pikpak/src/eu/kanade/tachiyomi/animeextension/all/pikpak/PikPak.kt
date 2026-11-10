@@ -6,6 +6,7 @@ import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.CatalogResponse
+import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.Meta
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaVideo
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StreamResponse
@@ -13,6 +14,7 @@ import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StremThruUserData
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.FetchType
 import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.Hoster.Companion.toHosterList
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -105,13 +107,43 @@ abstract class PikPak :
 
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = anime
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        if (anime.url.contains(SEASON_SEPARATOR)) {
+            anime.fetch_type = FetchType.Episodes
+            anime.initialized = true
+            return anime
+        }
+
+        val seasons = fetchMeta(anime.url)?.videos.orEmpty().distinctSeasons()
+        anime.fetch_type = if (seasons.size >= 2) FetchType.Seasons else FetchType.Episodes
+        anime.initialized = true
+        return anime
+    }
 
     // =============================== Seasons ==============================
 
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
-    override suspend fun getSeasonList(anime: SAnime): List<SAnime> = emptyList()
+    override suspend fun getSeasonList(anime: SAnime): List<SAnime> {
+        if (anime.url.contains(SEASON_SEPARATOR)) return emptyList()
+
+        val seasons = fetchMeta(anime.url)?.videos.orEmpty().distinctSeasons()
+        if (seasons.size < 2) return emptyList()
+
+        return seasons.map { season ->
+            SAnime.create().apply {
+                title = "Season $season"
+                url = "${anime.url}$SEASON_SEPARATOR$season"
+                season_number = season.toDouble()
+                fetch_type = FetchType.Episodes
+                initialized = true
+                thumbnail_url = anime.thumbnail_url
+                description = anime.description
+                genre = anime.genre
+                status = anime.status
+            }
+        }
+    }
 
     // ============================== Episodes ==============================
 
@@ -120,24 +152,36 @@ abstract class PikPak :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        validateAccount()
-        val meta = client.get(apiUrl("meta", "other", "${anime.url}.json"))
-            .parseAs<MetaResponse>()
-            .meta
-            ?: return emptyList()
+        val (catalogId, seasonFilter) = parseSeasonUrl(anime.url)
+        val videos = fetchMeta(catalogId)?.videos.orEmpty()
 
-        return meta.videos.orEmpty()
+        val filtered = if (seasonFilter == null) {
+            videos
+        } else {
+            videos.filter { seasonNumber(it) == seasonFilter }
+        }
+
+        val numbered = filtered
+            .sortedBy { it.title }
+            .map { video -> video to episodeNumber(video) }
+        var nextEpisode = (numbered.mapNotNull { it.second }.maxOrNull() ?: 0) + 1
+        val resolved = numbered.map { (video, number) ->
+            val episode = number ?: nextEpisode++
+            video to episode
+        }
+
+        return resolved
             .sortedWith(
-                compareBy<MetaVideo>(
-                    { it.season ?: 0 },
-                    { it.episode ?: 0 },
-                    { it.title },
+                compareBy<Pair<MetaVideo, Int>>(
+                    { seasonNumber(it.first) ?: 0 },
+                    { it.second },
+                    { it.first.title },
                 ),
             )
-            .mapIndexed { index, video ->
+            .map { (video, episode) ->
                 SEpisode.create().apply {
-                    episode_number = (video.episode?.takeIf { it > 0 } ?: (index + 1)).toFloat()
-                    name = episodeTitle(video.title, index)
+                    episode_number = episode.toFloat()
+                    name = formatEpisode(episode)
                     url = video.id
                     date_upload = parseDate(video.released)
                     preview_url = video.thumbnail.orEmpty()
@@ -262,16 +306,37 @@ abstract class PikPak :
         if (preferences.getBoolean(PREF_WEB_DOWNLOADS_KEY, true)) add(CATALOG_WEB_DOWNLOADS)
     }
 
-    private fun episodeTitle(rawTitle: String, index: Int): String {
-        val fallback = "Episode ${index + 1}"
-        if (rawTitle.isBlank()) return fallback
-        if (!preferences.getBoolean(PREF_FILENAME_KEY, PREF_FILENAME_DEFAULT)) return rawTitle
-
-        return rawTitle.substringAfterLast('\n')
-            .removePrefix("📄 ")
-            .trim()
-            .ifBlank { rawTitle }
+    private suspend fun fetchMeta(catalogId: String): Meta? {
+        validateAccount()
+        return client.get(apiUrl("meta", "other", "$catalogId.json"))
+            .parseAs<MetaResponse>()
+            .meta
     }
+
+    private fun parseSeasonUrl(url: String): Pair<String, Int?> {
+        val separator = url.lastIndexOf(SEASON_SEPARATOR)
+        if (separator == -1) return url to null
+
+        val season = url.substring(separator + SEASON_SEPARATOR.length).toIntOrNull()
+            ?: return url to null
+        return url.substring(0, separator) to season
+    }
+
+    private fun List<MetaVideo>.distinctSeasons(): List<Int> = mapNotNull { seasonNumber(it) }.distinct().sorted()
+
+    private fun seasonNumber(video: MetaVideo): Int? {
+        val fileName = video.title.substringAfterLast('\n')
+        SEASON_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return video.season
+    }
+
+    private fun episodeNumber(video: MetaVideo): Int? {
+        val fileName = video.title.substringAfterLast('\n')
+        EPISODE_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return video.episode
+    }
+
+    private fun formatEpisode(episode: Int): String = String.format(Locale.US, "E%02d", episode)
 
     private fun parseDate(date: String?): Long {
         val value = date?.take(19) ?: return 0L
@@ -326,16 +391,6 @@ abstract class PikPak :
                 preferences.edit().putBoolean(key, newValue as Boolean).commit()
             }
         }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_FILENAME_KEY
-            title = "Only display filename"
-            summary = "Hide the matched episode title StremThru adds before the file name."
-            setDefaultValue(PREF_FILENAME_DEFAULT)
-            setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putBoolean(key, newValue as Boolean).commit()
-            }
-        }.also(screen::addPreference)
     }
 
     companion object {
@@ -344,11 +399,13 @@ abstract class PikPak :
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
-        private const val PREF_FILENAME_KEY = "filename_only"
-        private const val PREF_FILENAME_DEFAULT = true
 
         private const val CATALOG_TORRENTS = "st:store:pp"
         private const val CATALOG_WEB_DOWNLOADS = "st:store:pp-webdl"
+
+        private const val SEASON_SEPARATOR = "|"
+        private val SEASON_REGEX = Regex("(?i)S(\\d{1,2})")
+        private val EPISODE_REGEX = Regex("(?i)E(\\d{1,4})")
 
         private const val PAGE_SIZE = 100
         private const val FALLBACK_POSTER = "https://mypikpak.com/android-chrome-192x192.png"
