@@ -58,9 +58,7 @@ internal class PikPakClient(
         explicitNulls = false
     }
 
-    // Deliberately different from StremThru's device id. Sharing the same PikPak
-    // device identity can invalidate StremThru's refresh token when this client logs in.
-    private val deviceId = getDeviceId("$username:$password:pikpak-direct")
+    private val deviceId = getDeviceId("$username:$password")
     private val mutex = Mutex()
 
     private var accessToken: String? = null
@@ -71,7 +69,20 @@ internal class PikPakClient(
     private var driveCaptcha: String? = null
     private var driveCaptchaExpiresAt: Long = 0
 
-    suspend fun list(itemId: String): Listing? = mutex.withLock {
+    suspend fun listMyPack(): List<PikPakFile> = mutex.withLock {
+        ensureAuthLocked()
+
+        val rootFiles = listChildrenLocked("")
+        val myPack = rootFiles.firstOrNull {
+            it.kind == KIND_FOLDER && it.name.equals("My Pack", ignoreCase = true)
+        } ?: throw IOException("PikPak 'My Pack' folder not found")
+
+        listChildrenLocked(myPack.id)
+            .filter { it.id.isNotBlank() && it.trashed != true }
+            .filter { it.phase == null || it.phase == PHASE_COMPLETE }
+    }
+
+    suspend fun list(itemId: String): Listing = mutex.withLock {
         ensureAuthLocked()
         val root = getFileLocked(itemId)
 
@@ -108,6 +119,20 @@ internal class PikPakClient(
 
         media?.link?.url?.takeIf { it.isNotBlank() }
             ?: file.webContentLink?.takeIf { it.isNotBlank() }
+    }
+
+    private suspend fun listChildrenLocked(parentId: String): List<PikPakFile> {
+        val result = mutableListOf<PikPakFile>()
+        var pageToken = ""
+        var pageCount = 0
+        do {
+            if (++pageCount > MAX_PAGES) break
+            val data = listFilesLocked(parentId, pageToken)
+            data.error?.let { throw IOException("PikPak list error: $it ${data.errorDescription.orEmpty()}") }
+            result.addAll(data.files.orEmpty())
+            pageToken = data.nextPageToken.orEmpty()
+        } while (pageToken.isNotEmpty())
+        return result
     }
 
     private suspend fun listRecursiveLocked(
@@ -180,9 +205,9 @@ internal class PikPakClient(
             .addPathSegment("files")
             .addQueryParameter("thumbnail_size", "SIZE_MEDIUM")
             .addQueryParameter("limit", "500")
-            .addQueryParameter("parent_id", parentId)
             .addQueryParameter("filters", FILTERS_JSON)
             .apply {
+                if (parentId.isNotBlank()) addQueryParameter("parent_id", parentId)
                 if (pageToken.isNotBlank()) addQueryParameter("page_token", pageToken)
             }
             .build()

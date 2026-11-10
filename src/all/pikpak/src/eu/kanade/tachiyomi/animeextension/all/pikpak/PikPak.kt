@@ -1,21 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.all.pikpak
 
 import android.text.InputType
-import android.util.Base64
 import android.util.Log
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.CatalogResponse
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.Meta
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaResponse
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.MetaVideo
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakEpisodeUrl
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StreamResponse
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.StremThruUserData
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.TorzData
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.TorzFile
-import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.TorzResponse
+import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFile
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -27,38 +17,23 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import keiyoushi.annotation.Source
-import keiyoushi.network.get
-import keiyoushi.network.head
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import okhttp3.CacheControl
-import okhttp3.Headers
-import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
-import uy.kohesive.injekt.injectLazy
 import java.io.IOException
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Browses the PikPak "My Pack" through StremThru.
+ * Direct PikPak source.
  *
- * The Stremio addon gives us the top-level My Pack catalog. For torrent items, the
- * StremThru Torz API additionally exposes each file's path, which lets us use the
- * first path segment (S0, SP, Season 1, ...) as the season name. WebDL items only
- * expose file names, so those fall back to S0x markers in the file names.
+ * The extension logs in with the configured PikPak email:password, lists "My Pack",
+ * resolves season folders from the real PikPak paths, and generates signed PikPak
+ * playback links itself. It does not use StremThru.
  */
 @Source
 abstract class PikPak :
@@ -67,21 +42,10 @@ abstract class PikPak :
 
     override val supportsLatest = false
 
-    private val json: Json by injectLazy()
-
     private val preferences by getPreferencesLazy()
 
-    private val noRedirectClient by lazy {
-        client.newBuilder()
-            .followRedirects(false)
-            .followSslRedirects(false)
-            .build()
-    }
-
-    @Volatile
-    private var validatedAccount: String? = null
-
     private val libraryCache = ConcurrentHashMap<String, Pair<Library, Long>>()
+    private val catalogCache = ConcurrentHashMap<String, Pair<List<PikPakFile>, Long>>()
 
     @Volatile
     private var directClientAccount: String? = null
@@ -95,10 +59,7 @@ abstract class PikPak :
 
     override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage {
-        validateAccount()
-        return fetchCatalogs(page, null)
-    }
+    override suspend fun getPopularAnime(page: Int): AnimesPage = catalogPage(myPack(), page)
 
     // =============================== Latest ===============================
 
@@ -116,8 +77,9 @@ abstract class PikPak :
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         if (query.isBlank()) return getPopularAnime(page)
-        validateAccount()
-        return fetchCatalogs(page, query)
+
+        val filtered = myPack().filter { it.name.contains(query, ignoreCase = true) }
+        return catalogPage(filtered, page)
     }
 
     // =========================== Anime Details ============================
@@ -125,25 +87,19 @@ abstract class PikPak :
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val (catalogId, season) = parseSeasonUrl(anime.url)
+        val (itemId, season) = parseSeasonUrl(anime.url)
         if (season != null) {
             anime.fetch_type = FetchType.Episodes
             anime.initialized = true
             return anime
         }
 
-        val library = libraryFor(catalogId)
-        if (library != null) {
-            if (library.name.isNotBlank()) {
-                anime.title = cleanAnimeName(library.name)
-            }
-            val seasons = library.entries.mapNotNull { it.season }.distinct()
-            anime.fetch_type = if (seasons.isNotEmpty()) FetchType.Seasons else FetchType.Episodes
-            Log.d(TAG, "details catalog=$catalogId webdl=${isWebDl(catalogId)} entries=${library.entries.size} seasons=$seasons type=${anime.fetch_type}")
-        } else {
-            anime.fetch_type = FetchType.Episodes
-            Log.d(TAG, "details catalog=$catalogId webdl=${isWebDl(catalogId)} no library")
+        val library = libraryFor(itemId)
+        if (library.name.isNotBlank()) {
+            anime.title = cleanAnimeName(library.name)
         }
+        val seasons = library.entries.mapNotNull { it.season }.distinct()
+        anime.fetch_type = if (seasons.isNotEmpty()) FetchType.Seasons else FetchType.Episodes
         anime.initialized = true
         return anime
     }
@@ -153,21 +109,20 @@ abstract class PikPak :
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
     override suspend fun getSeasonList(anime: SAnime): List<SAnime> {
-        val (catalogId, season) = parseSeasonUrl(anime.url)
+        val (itemId, season) = parseSeasonUrl(anime.url)
         if (season != null) return emptyList()
 
-        val library = libraryFor(catalogId) ?: return emptyList()
+        val library = libraryFor(itemId)
         val seasons = library.entries
             .mapNotNull { it.season }
             .distinct()
             .sortedWith(compareBy<String> { seasonSortKey(it) }.thenBy { it })
-        Log.d(TAG, "seasons catalog=$catalogId entries=${library.entries.size} seasons=$seasons")
         if (seasons.isEmpty()) return emptyList()
 
         return seasons.map { label ->
             SAnime.create().apply {
                 title = label
-                url = "$catalogId$SEASON_SEPARATOR$label"
+                url = "$itemId$SEASON_SEPARATOR$label"
                 season_number = seasonNumberFromLabel(label)
                 fetch_type = FetchType.Episodes
                 initialized = true
@@ -186,8 +141,8 @@ abstract class PikPak :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val (catalogId, seasonFilter) = parseSeasonUrl(anime.url)
-        val library = libraryFor(catalogId) ?: return emptyList()
+        val (itemId, seasonFilter) = parseSeasonUrl(anime.url)
+        val library = libraryFor(itemId)
 
         val filtered = if (seasonFilter == null) {
             library.entries
@@ -216,7 +171,7 @@ abstract class PikPak :
                 SEpisode.create().apply {
                     episode_number = episode.toFloat()
                     name = formatEpisode(episode)
-                    url = json.encodeToString(PikPakEpisodeUrl(entry.fileId, entry.streamId))
+                    url = entry.fileId
                     date_upload = parseDate(entry.released)
                     preview_url = entry.thumbnail.orEmpty()
                 }
@@ -228,246 +183,112 @@ abstract class PikPak :
     override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val details = runCatching { episode.url.parseAs<PikPakEpisodeUrl>() }
-            .getOrElse { PikPakEpisodeUrl(fileId = null, streamId = episode.url) }
-
-        val directUrl = if (preferences.getBoolean(PREF_DIRECT_KEY, true)) {
-            details.fileId?.let { fileId ->
-                try {
-                    directClient()?.getStreamUrl(fileId)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.d(TAG, "direct stream failed file=$fileId error=${e.message}")
-                    null
-                }
-            }
-        } else {
-            null
+        val fileId = episode.url
+        if (fileId.startsWith("{") || fileId.contains(':')) {
+            throw IOException("This episode list is from an older version. Refresh the anime.")
         }
 
-        if (directUrl != null) {
-            Log.d(TAG, "direct stream file=${details.fileId} ok")
-            return listOf(
-                Video(
-                    videoUrl = directUrl,
-                    videoTitle = episode.name,
-                ),
-            ).toHosterList()
-        }
+        val client = directClient()
+            ?: throw IOException("Please enter your PikPak email:password in the extension settings.")
 
-        validateAccount()
-        val streams = try {
-            client.get(
-                apiUrl("stream", "other", "${details.streamId}.json"),
-                cacheControl = CacheControl.FORCE_NETWORK,
-            ).parseAs<StreamResponse>().streams.orEmpty()
-        } catch (e: IOException) {
-            Log.d(TAG, "stremthru stream fallback failed: ${e.message}")
+        val url = try {
+            client.getStreamUrl(fileId)
+        } catch (e: CancellationException) {
             throw e
-        }
+        } catch (e: Exception) {
+            Log.d(TAG, "direct stream failed file=$fileId error=${e.message}")
+            throw IOException("Could not generate a PikPak playback link: ${e.message}", e)
+        } ?: throw IOException("PikPak did not return a playback link for this file.")
 
-        val videos = streams.mapNotNull { stream ->
-            val streamUrl = stream.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        Log.d(TAG, "direct stream file=$fileId ok")
+        return listOf(
             Video(
-                videoUrl = resolveVideoUrl(streamUrl),
-                videoTitle = stream.name ?: stream.title ?: episode.name,
-            )
-        }
-
-        return videos.toHosterList()
+                videoUrl = url,
+                videoTitle = episode.name,
+            ),
+        ).toHosterList()
     }
 
     override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
 
-    // ============================= Utilities ==============================
+    // ============================== Catalog ===============================
 
-    private suspend fun fetchCatalogs(page: Int, query: String?): AnimesPage {
-        val catalogs = selectedCatalogs()
-        if (catalogs.isEmpty()) return AnimesPage(emptyList(), false)
+    private suspend fun myPack(): List<PikPakFile> {
+        val key = account()
+        val now = System.currentTimeMillis()
+        catalogCache[key]?.let { (items, expiresAt) ->
+            if (expiresAt > now) return filterCatalog(items)
+        }
 
-        return coroutineScope {
-            val results = catalogs
-                .map { catalog -> async { fetchCatalog(catalog, page, query) } }
-                .awaitAll()
+        val client = directClient()
+            ?: throw IOException("Please enter your PikPak email:password in the extension settings.")
 
-            AnimesPage(
-                animes = results.flatMap { it.first },
-                hasNextPage = results.any { it.second },
+        val items = try {
+            client.listMyPack()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "my pack failed: ${e.message}")
+            throw IOException("Could not list PikPak My Pack: ${e.message}", e)
+        }
+
+        catalogCache[key] = items to (now + CATALOG_CACHE_MS)
+        return filterCatalog(items)
+    }
+
+    private fun filterCatalog(items: List<PikPakFile>): List<PikPakFile> {
+        val showTorrents = preferences.getBoolean(PREF_TORRENTS_KEY, true)
+        val showWebDownloads = preferences.getBoolean(PREF_WEB_DOWNLOADS_KEY, true)
+
+        return items
+            .filter { item ->
+                val isTorrent = item.params?.url?.startsWith("magnet:", ignoreCase = true) == true
+                if (isTorrent) showTorrents else showWebDownloads
+            }
+            .sortedWith(
+                compareByDescending<PikPakFile> { it.createdTime.orEmpty() }
+                    .thenBy { it.name.lowercase(Locale.US) },
             )
-        }
     }
 
-    private suspend fun fetchCatalog(catalog: String, page: Int, query: String?): Pair<List<SAnime>, Boolean> {
-        val skip = (page - 1) * PAGE_SIZE
-        val requestUrl = apiUrlBuilder()
-            .addPathSegment("catalog")
-            .addPathSegment("other")
-            .apply {
-                when {
-                    query.isNullOrBlank() && skip == 0 -> {
-                        addPathSegment("$catalog.json")
-                    }
-                    query.isNullOrBlank() -> {
-                        addPathSegment(catalog)
-                        addPathSegment("skip=$skip.json")
-                    }
-                    else -> {
-                        val encodedQuery = URLEncoder.encode(query, Charsets.UTF_8.name())
-                        addPathSegment(catalog)
-                        addPathSegment("search=$encodedQuery&skip=$skip.json")
-                    }
-                }
-            }
-            .build()
+    private fun catalogPage(items: List<PikPakFile>, page: Int): AnimesPage {
+        val start = (page - 1) * PAGE_SIZE
+        if (start >= items.size) return AnimesPage(emptyList(), false)
 
-        val metas = client.get(
-            requestUrl,
-            cacheControl = CacheControl.FORCE_NETWORK,
-        ).parseAs<CatalogResponse>().metas.orEmpty()
-
-        val animeList = metas.map { meta ->
+        val end = minOf(start + PAGE_SIZE, items.size)
+        val animes = items.subList(start, end).map { item ->
             SAnime.create().apply {
-                title = cleanAnimeName(meta.name)
-                url = meta.id
-                description = meta.description.orEmpty()
-                thumbnail_url = meta.poster?.takeIf { it.isNotBlank() } ?: FALLBACK_POSTER
-                meta.background?.takeIf { it.isNotBlank() }?.let { background_url = it }
+                title = cleanAnimeName(item.name).ifBlank { item.id }
+                url = item.id
+                description = if (item.params?.url?.startsWith("magnet:", ignoreCase = true) == true) {
+                    "PikPak torrent"
+                } else {
+                    "PikPak file"
+                }
+                thumbnail_url = item.thumbnailLink?.takeIf { it.isNotBlank() } ?: FALLBACK_POSTER
             }
         }
 
-        return animeList to (metas.size >= PAGE_SIZE)
+        return AnimesPage(animes, end < items.size)
     }
 
-    private fun apiUrl(vararg segments: String): HttpUrl = apiUrlBuilder()
-        .apply { segments.forEach(::addPathSegment) }
-        .build()
+    // ============================== Library ===============================
 
-    private fun apiUrlBuilder(): HttpUrl.Builder = baseUrl.toHttpUrl().newBuilder()
-        .addPathSegment("stremio")
-        .addPathSegment("store")
-        .addPathSegment(encodedUserData())
-
-    private fun apiHeaders(useAuthorization: Boolean = false): Headers = Headers.Builder()
-        .add("X-StremThru-Store-Name", STORE_NAME)
-        .apply {
-            val value = "Bearer ${account()}"
-            if (useAuthorization) {
-                add("Authorization", value)
-            } else {
-                add("X-StremThru-Store-Authorization", value)
-            }
-        }
-        .build()
-
-    private suspend fun validateAccount() {
-        val key = "${baseUrl.trimEnd('/')}|${account()}"
-        if (validatedAccount == key) return
-
-        try {
-            client.get(apiUrl("manifest.json")).use { }
-        } catch (e: IOException) {
-            Log.d(TAG, "account validation failed: ${e.message}")
-            throw IOException("Could not sign in to PikPak through StremThru. Check the account and base URL. (${e.message})", e)
-        }
-        validatedAccount = key
-    }
-
-    private fun account(): String = preferences.getString(PREF_ACCOUNT_KEY, null)
-        ?.trim()
-        ?.takeIf { it.isNotBlank() }
-        ?: throw Exception("Please enter your PikPak email:password in the extension settings.")
-
-    private fun encodedUserData(): String {
-        val userData = StremThruUserData(storeName = STORE_NAME, storeToken = account())
-        val blob = json.encodeToString(userData)
-        return Base64.encodeToString(blob.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-    }
-
-    private fun selectedCatalogs(): List<String> = buildList {
-        if (preferences.getBoolean(PREF_TORRENTS_KEY, true)) add(CATALOG_TORRENTS)
-        if (preferences.getBoolean(PREF_WEB_DOWNLOADS_KEY, true)) add(CATALOG_WEB_DOWNLOADS)
-    }
-
-    private suspend fun fetchMeta(catalogId: String): Meta? {
-        validateAccount()
-        return client.get(
-            apiUrl("meta", "other", "$catalogId.json"),
-            cacheControl = CacheControl.FORCE_NETWORK,
-        ).parseAs<MetaResponse>().meta
-    }
-
-    private suspend fun fetchTorz(catalogId: String): TorzData? {
-        val itemId = when {
-            catalogId.startsWith("$CATALOG_TORRENTS:") -> catalogId.removePrefix("$CATALOG_TORRENTS:")
-            catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> catalogId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
-            else -> return null
-        }
-        if (itemId.isBlank()) return null
-        validateAccount()
-
-        return requestTorz(itemId, useAuthorization = false)
-            ?: requestTorz(itemId, useAuthorization = true)
-    }
-
-    private suspend fun requestTorz(itemId: String, useAuthorization: Boolean): TorzData? {
-        val headerName = if (useAuthorization) "Authorization" else "X-StremThru-Store-Authorization"
-        val url = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegment("v0")
-            .addPathSegment("store")
-            .addPathSegment("torz")
-            .addPathSegment(itemId)
-            .build()
-
-        val data = runCatching {
-            client.get(url, apiHeaders(useAuthorization), CacheControl.FORCE_NETWORK)
-                .parseAs<TorzResponse>()
-                .data
-        }.onFailure {
-            Log.d(TAG, "torz failed item=$itemId header=$headerName url=$url error=${it.message}")
-        }.getOrNull()
-
-        if (data == null) {
-            Log.d(TAG, "torz empty item=$itemId header=$headerName url=$url")
-        } else {
-            Log.d(TAG, "torz item=$itemId header=$headerName files=${data.files?.size ?: 0} name=${data.name}")
-        }
-        return data
-    }
-
-    private suspend fun libraryFor(catalogId: String): Library? {
-        val key = "${baseUrl.trimEnd('/')}|${account()}|$catalogId"
+    private suspend fun libraryFor(itemId: String): Library {
+        val key = "${account()}|$itemId"
         val now = System.currentTimeMillis()
         libraryCache[key]?.let { (library, expiresAt) ->
             if (expiresAt > now) return library
         }
 
-        val direct = directLibrary(catalogId)
-        val torz = if (direct?.entries?.isNotEmpty() == true) null else torzLibrary(catalogId)
-        val library = direct?.takeIf { it.entries.isNotEmpty() }
-            ?: torz?.takeIf { it.entries.isNotEmpty() }
-            ?: metaLibrary(catalogId)
-            ?: direct
-            ?: torz
-
-        Log.d(
-            TAG,
-            "library catalog=$catalogId webdl=${isWebDl(catalogId)} directEntries=${direct?.entries?.size} " +
-                "directSeasons=${direct?.entries?.mapNotNull { it.season }?.distinct()} " +
-                "torzEntries=${torz?.entries?.size} torzSeasons=${torz?.entries?.mapNotNull { it.season }?.distinct()} " +
-                "used=entries:${library?.entries?.size} seasons:${library?.entries?.mapNotNull { it.season }?.distinct()}",
-        )
-        if (library != null) {
-            libraryCache[key] = library to (now + LIBRARY_CACHE_MS)
-        }
+        val library = directLibrary(itemId)
+        libraryCache[key] = library to (now + LIBRARY_CACHE_MS)
         return library
     }
 
-    private suspend fun directLibrary(catalogId: String): Library? {
-        if (!preferences.getBoolean(PREF_DIRECT_KEY, true)) return null
-
-        val itemId = catalogItemId(catalogId) ?: return null
-        val client = directClient() ?: return null
+    private suspend fun directLibrary(itemId: String): Library {
+        val client = directClient()
+            ?: throw IOException("Please enter your PikPak email:password in the extension settings.")
 
         val listing = try {
             client.list(itemId)
@@ -475,8 +296,8 @@ abstract class PikPak :
             throw e
         } catch (e: Exception) {
             Log.d(TAG, "direct failed item=$itemId error=${e.message}")
-            null
-        } ?: return null
+            throw IOException("Could not list PikPak item: ${e.message}", e)
+        }
 
         val entries = listing.files
             .filter { file -> isVideoFile(file.name.ifBlank { file.path.substringAfterLast('/') }) }
@@ -484,10 +305,9 @@ abstract class PikPak :
                 val fileName = file.name.ifBlank { file.path.substringAfterLast('/') }
                 EpisodeEntry(
                     fileName = fileName,
-                    streamId = "$catalogId:${encodePathSegment(lockedLink(listing.rootId, file.id))}",
+                    fileId = file.id,
                     season = pathSeasonKey(listing.name, file.path, fileName),
                     episode = parseEpisodeNumber(fileName),
-                    fileId = file.id,
                     released = file.createdTime,
                     thumbnail = file.thumbnailLink,
                 )
@@ -516,103 +336,12 @@ abstract class PikPak :
         }
     }
 
-    private fun catalogItemId(catalogId: String): String? = when {
-        catalogId.startsWith("$CATALOG_TORRENTS:") -> catalogId.removePrefix("$CATALOG_TORRENTS:")
-        catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> catalogId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
-        else -> null
-    }?.takeIf { it.isNotBlank() }
+    private fun account(): String = preferences.getString(PREF_ACCOUNT_KEY, null)
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+        ?: throw Exception("Please enter your PikPak email:password in the extension settings.")
 
-    private fun lockedLink(rootId: String, fileId: String): String = "stremthru://store/pikpak/" + Base64.encodeToString(
-        "$rootId:$fileId".toByteArray(Charsets.UTF_8),
-        Base64.NO_WRAP,
-    )
-
-    private fun fileIdFromLockedLink(link: String): String? {
-        val encoded = link.removePrefix("stremthru://store/pikpak/")
-        if (encoded == link || encoded.isBlank()) return null
-
-        return runCatching {
-            String(Base64.decode(encoded, Base64.NO_WRAP), Charsets.UTF_8)
-        }.getOrNull()
-            ?.substringAfter(':', "")
-            ?.takeIf { it.isNotBlank() }
-    }
-
-    private fun fileIdFromStreamId(streamId: String): String? {
-        val afterPrefix = when {
-            streamId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> streamId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
-            streamId.startsWith("$CATALOG_TORRENTS:") -> streamId.removePrefix("$CATALOG_TORRENTS:")
-            else -> return null
-        }
-        val escapedLink = afterPrefix.substringAfter(':', "")
-        if (escapedLink.isBlank()) return null
-        return fileIdFromLockedLink(percentDecode(escapedLink))
-    }
-
-    private fun percentDecode(value: String): String {
-        val bytes = java.io.ByteArrayOutputStream()
-        var index = 0
-        while (index < value.length) {
-            val char = value[index]
-            if (char == '%' && index + 2 < value.length) {
-                val hex = value.substring(index + 1, index + 3).toIntOrNull(16)
-                if (hex != null) {
-                    bytes.write(hex)
-                    index += 3
-                    continue
-                }
-            }
-            bytes.write(char.code)
-            index++
-        }
-        return bytes.toByteArray().toString(Charsets.UTF_8)
-    }
-
-    private suspend fun torzLibrary(catalogId: String): Library? {
-        val data = fetchTorz(catalogId) ?: return null
-        val itemName = data.name.ifBlank { catalogId.substringAfterLast(':') }
-        val entries = data.files.orEmpty()
-            .filter { file -> file.link.isNotBlank() && isVideoFile(file.name.ifBlank { file.path }.trim()) }
-            .map { file ->
-                val fileName = file.name.ifBlank { file.path.substringAfterLast('/') }.trim()
-                EpisodeEntry(
-                    fileName = fileName,
-                    streamId = "$catalogId:${encodePathSegment(file.link)}",
-                    season = torzSeasonKey(itemName, file),
-                    episode = parseEpisodeNumber(fileName),
-                    fileId = fileIdFromLockedLink(file.link),
-                )
-            }
-        return Library(data.name, withOtherSeason(entries))
-    }
-
-    private suspend fun metaLibrary(catalogId: String): Library? {
-        val meta = fetchMeta(catalogId) ?: return null
-        val entries = meta.videos.orEmpty().map { video ->
-            val fileName = videoFileName(video)
-            EpisodeEntry(
-                fileName = fileName,
-                streamId = video.id,
-                season = seasonKey(video),
-                episode = parseEpisodeNumber(fileName) ?: video.episode,
-                fileId = fileIdFromStreamId(video.id),
-                released = video.released,
-                thumbnail = video.thumbnail,
-            )
-        }
-        return Library(meta.name, withOtherSeason(entries))
-    }
-
-    private fun isWebDl(catalogId: String): Boolean = catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:")
-
-    private fun withOtherSeason(entries: List<EpisodeEntry>): List<EpisodeEntry> {
-        if (entries.none { it.season != null }) return entries
-        return entries.map { entry ->
-            if (entry.season == null) entry.copy(season = OTHER_SEASON) else entry
-        }
-    }
-
-    private fun torzSeasonKey(itemName: String, file: TorzFile): String? = pathSeasonKey(itemName, file.path, file.name)
+    // ============================= Utilities ==============================
 
     private fun pathSeasonKey(itemName: String, rawPath: String, fallbackName: String): String? {
         val path = rawPath.replace('\\', '/').trim('/').ifBlank { fallbackName }
@@ -641,15 +370,33 @@ abstract class PikPak :
         return season
     }
 
-    private fun videoFileName(video: MetaVideo): String = video.title.substringAfterLast('\n').removePrefix("📄 ").trim()
+    private fun withOtherSeason(entries: List<EpisodeEntry>): List<EpisodeEntry> {
+        if (entries.none { it.season != null }) return entries
+        return entries.map { entry ->
+            if (entry.season == null) entry.copy(season = OTHER_SEASON) else entry
+        }
+    }
 
-    private fun seasonKey(video: MetaVideo): String? {
-        val fileName = videoFileName(video)
-        if (SPECIAL_REGEX.containsMatchIn(fileName)) return "SP"
-        SEASON_EPISODE_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
-        SEASON_NAME_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
-        SEASON_ONLY_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
-        return video.season?.let { "S$it" }
+    private fun seasonSortKey(season: String): Int {
+        if (season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true)) return 0
+        SEASON_NAME_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        SEASON_EPISODE_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        SEASON_ONLY_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return Int.MAX_VALUE
+    }
+
+    private fun seasonNumberFromLabel(season: String): Double {
+        val key = seasonSortKey(season)
+        return if (key == Int.MAX_VALUE) 0.0 else key.toDouble()
+    }
+
+    private fun parseSeasonUrl(url: String): Pair<String, String?> {
+        val separator = url.lastIndexOf(SEASON_SEPARATOR)
+        if (separator == -1) return url to null
+
+        val season = url.substring(separator + SEASON_SEPARATOR.length)
+        if (season.isBlank()) return url to null
+        return url.substring(0, separator) to season
     }
 
     private fun parseEpisodeNumber(fileName: String): Int? {
@@ -674,26 +421,12 @@ abstract class PikPak :
         return null
     }
 
-    private fun seasonSortKey(season: String): Int {
-        if (season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true)) return 0
-        SEASON_NAME_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        SEASON_EPISODE_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        SEASON_ONLY_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        return Int.MAX_VALUE
-    }
+    private fun formatEpisode(episode: Int): String = String.format(Locale.US, "E%02d", episode)
 
-    private fun seasonNumberFromLabel(season: String): Double {
-        val key = seasonSortKey(season)
-        return if (key == Int.MAX_VALUE) 0.0 else key.toDouble()
-    }
-
-    private fun parseSeasonUrl(url: String): Pair<String, String?> {
-        val separator = url.lastIndexOf(SEASON_SEPARATOR)
-        if (separator == -1) return url to null
-
-        val season = url.substring(separator + SEASON_SEPARATOR.length)
-        if (season.isBlank()) return url to null
-        return url.substring(0, separator) to season
+    private fun parseDate(date: String?): Long {
+        val value = date?.take(19) ?: return 0L
+        val parsed = synchronized(DATE_FORMATTER) { DATE_FORMATTER.tryParse(value) }
+        return parsed.takeIf { it > 0L } ?: 0L
     }
 
     private fun cleanAnimeName(name: String): String {
@@ -723,51 +456,24 @@ abstract class PikPak :
 
     private fun isVideoFile(name: String): Boolean = VIDEO_EXTENSIONS.any { name.endsWith(it, ignoreCase = true) }
 
-    private fun encodePathSegment(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
-
-    private fun formatEpisode(episode: Int): String = String.format(Locale.US, "E%02d", episode)
-
-    private fun parseDate(date: String?): Long {
-        val value = date?.take(19) ?: return 0L
-        val parsed = synchronized(DATE_FORMATTER) { DATE_FORMATTER.tryParse(value) }
-        return parsed.takeIf { it > 0L } ?: 0L
-    }
-
-    /**
-     * StremThru returns a redirect to a short-lived PikPak link. Resolve it here so the
-     * player never sees the account credentials embedded in the addon URL.
-     */
-    private suspend fun resolveVideoUrl(url: String): String = runCatching {
-        noRedirectClient.head(url, cacheControl = CacheControl.FORCE_NETWORK, ensureSuccess = false).use { response ->
-            response.header("Location")
-                ?.takeIf { it.startsWith("http", ignoreCase = true) }
-                ?: url
-        }
-    }.getOrDefault(url)
-
     // ============================ Preferences =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_ACCOUNT_KEY
             title = "PikPak account"
-            summary = "Email:password. Sent only to the configured StremThru instance."
+            summary = "Email:password."
             setDefaultValue("")
             setOnBindEditTextListener { editText ->
                 editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
             setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putString(key, (newValue as String).trim()).commit()
-            }
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_DIRECT_KEY
-            title = "Direct PikPak connection"
-            summary = "List folders and generate playback links directly from PikPak. Turn off to use only StremThru."
-            setDefaultValue(true)
-            setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putBoolean(key, newValue as Boolean).commit()
+                val value = (newValue as String).trim()
+                catalogCache.clear()
+                libraryCache.clear()
+                directClient = null
+                directClientAccount = null
+                preferences.edit().putString(key, value).commit()
             }
         }.also(screen::addPreference)
 
@@ -799,28 +505,28 @@ abstract class PikPak :
 
     private data class EpisodeEntry(
         val fileName: String,
-        val streamId: String,
+        val fileId: String,
         val season: String?,
         val episode: Int?,
-        val fileId: String? = null,
         val released: String? = null,
         val thumbnail: String? = null,
     )
 
     companion object {
         private const val TAG = "PikPak"
-        private const val STORE_NAME = "pikpak"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
-        private const val PREF_DIRECT_KEY = "direct_pikpak"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
 
-        private const val CATALOG_TORRENTS = "st:store:pp"
-        private const val CATALOG_WEB_DOWNLOADS = "st:store:pp-webdl"
-
         private const val SEASON_SEPARATOR = "|"
         private const val OTHER_SEASON = "Other"
+
+        private const val CATALOG_CACHE_MS = 5_000L
+        private const val LIBRARY_CACHE_MS = 2_000L
+        private const val PAGE_SIZE = 100
+
+        private const val FALLBACK_POSTER = "https://mypikpak.com/android-chrome-192x192.png"
 
         private val SEASON_EPISODE_REGEX = Regex("(?i)S(\\d{1,2})[\\s._-]*E(\\d{1,4})")
         private val SEASON_NAME_REGEX = Regex("(?i)Season\\s*(\\d{1,2})")
@@ -861,10 +567,6 @@ abstract class PikPak :
             ".mp4", ".mkv", ".avi", ".flv", ".mov", ".webm", ".wmv", ".m4v",
             ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp", ".ogv",
         )
-
-        private const val LIBRARY_CACHE_MS = 2_000L
-        private const val PAGE_SIZE = 100
-        private const val FALLBACK_POSTER = "https://mypikpak.com/android-chrome-192x192.png"
 
         private val DATE_FORMATTER = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")

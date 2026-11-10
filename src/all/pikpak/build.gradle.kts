@@ -12,8 +12,6 @@ yuzono {
 
     source {
         lang = "all"
-        baseUrl {
-            custom("https://stremthru.elfhosted.com")
-        }
+        baseUrl = "https://mypikpak.com"
     }
 }
