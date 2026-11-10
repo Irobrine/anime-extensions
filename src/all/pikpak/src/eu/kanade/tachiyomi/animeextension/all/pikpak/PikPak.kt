@@ -253,10 +253,15 @@ abstract class PikPak :
         }
 
         validateAccount()
-        val streams = client.get(
-            apiUrl("stream", "other", "${details.streamId}.json"),
-            cacheControl = CacheControl.FORCE_NETWORK,
-        ).parseAs<StreamResponse>().streams.orEmpty()
+        val streams = try {
+            client.get(
+                apiUrl("stream", "other", "${details.streamId}.json"),
+                cacheControl = CacheControl.FORCE_NETWORK,
+            ).parseAs<StreamResponse>().streams.orEmpty()
+        } catch (e: IOException) {
+            Log.d(TAG, "stremthru stream fallback failed: ${e.message}")
+            throw e
+        }
 
         val videos = streams.mapNotNull { stream ->
             val streamUrl = stream.url?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -358,6 +363,7 @@ abstract class PikPak :
         try {
             client.get(apiUrl("manifest.json")).use { }
         } catch (e: IOException) {
+            Log.d(TAG, "account validation failed: ${e.message}")
             throw IOException("Could not sign in to PikPak through StremThru. Check the account and base URL. (${e.message})", e)
         }
         validatedAccount = key

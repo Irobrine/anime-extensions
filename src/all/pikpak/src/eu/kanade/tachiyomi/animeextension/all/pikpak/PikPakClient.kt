@@ -58,7 +58,9 @@ internal class PikPakClient(
         explicitNulls = false
     }
 
-    private val deviceId = getDeviceId("$username:$password")
+    // Deliberately different from StremThru's device id. Sharing the same PikPak
+    // device identity can invalidate StremThru's refresh token when this client logs in.
+    private val deviceId = getDeviceId("$username:$password:pikpak-direct")
     private val mutex = Mutex()
 
     private var accessToken: String? = null
