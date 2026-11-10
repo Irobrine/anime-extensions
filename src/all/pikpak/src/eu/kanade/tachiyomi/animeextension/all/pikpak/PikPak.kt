@@ -254,7 +254,10 @@ abstract class PikPak :
             }
             .build()
 
-        val metas = client.get(requestUrl).parseAs<CatalogResponse>().metas.orEmpty()
+        val metas = client.get(
+            requestUrl,
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).parseAs<CatalogResponse>().metas.orEmpty()
 
         val animeList = metas.map { meta ->
             SAnime.create().apply {
@@ -308,9 +311,10 @@ abstract class PikPak :
 
     private suspend fun fetchMeta(catalogId: String): Meta? {
         validateAccount()
-        return client.get(apiUrl("meta", "other", "$catalogId.json"))
-            .parseAs<MetaResponse>()
-            .meta
+        return client.get(
+            apiUrl("meta", "other", "$catalogId.json"),
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).parseAs<MetaResponse>().meta
     }
 
     private fun parseSeasonUrl(url: String): Pair<String, Int?> {
