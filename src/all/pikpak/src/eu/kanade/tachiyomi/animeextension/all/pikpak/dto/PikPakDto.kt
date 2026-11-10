@@ -66,3 +66,24 @@ data class Stream(
     val name: String? = null,
     val title: String? = null,
 )
+
+@Serializable
+data class TorzResponse(
+    val data: TorzData? = null,
+)
+
+@Serializable
+data class TorzData(
+    val id: String = "",
+    val name: String = "",
+    val files: List<TorzFile>? = null,
+)
+
+@Serializable
+data class TorzFile(
+    val index: Int? = null,
+    val link: String = "",
+    val name: String = "",
+    val path: String = "",
+    val size: Long? = null,
+)
