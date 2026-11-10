@@ -101,6 +101,7 @@ abstract class PikPak :
         val seasons = library.entries.mapNotNull { it.season }.distinct()
         anime.fetch_type = if (seasons.isNotEmpty()) FetchType.Seasons else FetchType.Episodes
         anime.initialized = true
+        Log.d(TAG, "details item=$itemId seasons=$seasons type=${anime.fetch_type}")
         return anime
     }
 
@@ -117,6 +118,7 @@ abstract class PikPak :
             .mapNotNull { it.season }
             .distinct()
             .sortedWith(compareBy<String> { seasonSortKey(it) }.thenBy { it })
+        Log.d(TAG, "seasons item=$itemId seasons=$seasons")
         if (seasons.isEmpty()) return emptyList()
 
         return seasons.map { label ->
@@ -159,6 +161,7 @@ abstract class PikPak :
             entry to episode
         }
 
+        Log.d(TAG, "episodes item=$itemId season=$seasonFilter count=${resolved.size}")
         return resolved
             .sortedWith(
                 compareBy<Pair<EpisodeEntry, Int>>(
@@ -306,7 +309,7 @@ abstract class PikPak :
                 EpisodeEntry(
                     fileName = fileName,
                     fileId = file.id,
-                    season = pathSeasonKey(listing.name, file.path, fileName),
+                    season = pathSeasonKey(listing.name, file.path, fileName) ?: seasonKeyFromFileName(fileName),
                     episode = parseEpisodeNumber(fileName),
                     released = file.createdTime,
                     thumbnail = file.thumbnailLink,
@@ -375,6 +378,14 @@ abstract class PikPak :
         return entries.map { entry ->
             if (entry.season == null) entry.copy(season = OTHER_SEASON) else entry
         }
+    }
+
+    private fun seasonKeyFromFileName(fileName: String): String? {
+        if (SPECIAL_REGEX.containsMatchIn(fileName)) return "SP"
+        SEASON_EPISODE_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
+        SEASON_NAME_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
+        SEASON_ONLY_REGEX.find(fileName)?.groupValues?.get(1)?.toIntOrNull()?.let { return "S$it" }
+        return null
     }
 
     private fun seasonSortKey(season: String): Int {
