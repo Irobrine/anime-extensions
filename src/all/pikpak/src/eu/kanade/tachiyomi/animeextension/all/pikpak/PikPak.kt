@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.pikpak
 
 import android.text.InputType
 import android.util.Base64
+import android.util.Log
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -130,8 +131,10 @@ abstract class PikPak :
             }
             val seasons = library.entries.mapNotNull { it.season }.distinct()
             anime.fetch_type = if (seasons.isNotEmpty()) FetchType.Seasons else FetchType.Episodes
+            Log.d(TAG, "details catalog=$catalogId webdl=${isWebDl(catalogId)} entries=${library.entries.size} seasons=$seasons type=${anime.fetch_type}")
         } else {
             anime.fetch_type = FetchType.Episodes
+            Log.d(TAG, "details catalog=$catalogId webdl=${isWebDl(catalogId)} no library")
         }
         anime.initialized = true
         return anime
@@ -150,6 +153,7 @@ abstract class PikPak :
             .mapNotNull { it.season }
             .distinct()
             .sortedWith(compareBy<String> { seasonSortKey(it) }.thenBy { it })
+        Log.d(TAG, "seasons catalog=$catalogId entries=${library.entries.size} seasons=$seasons")
         if (seasons.isEmpty()) return emptyList()
 
         return seasons.map { label ->
@@ -303,9 +307,16 @@ abstract class PikPak :
         .addPathSegment("store")
         .addPathSegment(encodedUserData())
 
-    private fun apiHeaders(): Headers = Headers.Builder()
+    private fun apiHeaders(useAuthorization: Boolean = false): Headers = Headers.Builder()
         .add("X-StremThru-Store-Name", STORE_NAME)
-        .add("X-StremThru-Store-Authorization", "Bearer ${account()}")
+        .apply {
+            val value = "Bearer ${account()}"
+            if (useAuthorization) {
+                add("Authorization", value)
+            } else {
+                add("X-StremThru-Store-Authorization", value)
+            }
+        }
         .build()
 
     private suspend fun validateAccount() {
@@ -345,10 +356,20 @@ abstract class PikPak :
     }
 
     private suspend fun fetchTorz(catalogId: String): TorzData? {
-        val itemId = catalogId.removePrefix("$CATALOG_TORRENTS:")
-        if (itemId == catalogId || itemId.isBlank()) return null
+        val itemId = when {
+            catalogId.startsWith("$CATALOG_TORRENTS:") -> catalogId.removePrefix("$CATALOG_TORRENTS:")
+            catalogId.startsWith("$CATALOG_WEB_DOWNLOADS:") -> catalogId.removePrefix("$CATALOG_WEB_DOWNLOADS:")
+            else -> return null
+        }
+        if (itemId.isBlank()) return null
         validateAccount()
 
+        return requestTorz(itemId, useAuthorization = false)
+            ?: requestTorz(itemId, useAuthorization = true)
+    }
+
+    private suspend fun requestTorz(itemId: String, useAuthorization: Boolean): TorzData? {
+        val headerName = if (useAuthorization) "Authorization" else "X-StremThru-Store-Authorization"
         val url = baseUrl.toHttpUrl().newBuilder()
             .addPathSegment("v0")
             .addPathSegment("store")
@@ -356,11 +377,20 @@ abstract class PikPak :
             .addPathSegment(itemId)
             .build()
 
-        return runCatching {
-            client.get(url, apiHeaders(), CacheControl.FORCE_NETWORK)
+        val data = runCatching {
+            client.get(url, apiHeaders(useAuthorization), CacheControl.FORCE_NETWORK)
                 .parseAs<TorzResponse>()
                 .data
+        }.onFailure {
+            Log.d(TAG, "torz failed item=$itemId header=$headerName url=$url error=${it.message}")
         }.getOrNull()
+
+        if (data == null) {
+            Log.d(TAG, "torz empty item=$itemId header=$headerName url=$url")
+        } else {
+            Log.d(TAG, "torz item=$itemId header=$headerName files=${data.files?.size ?: 0} name=${data.name}")
+        }
+        return data
     }
 
     private suspend fun libraryFor(catalogId: String): Library? {
@@ -370,11 +400,17 @@ abstract class PikPak :
             if (expiresAt > now) return library
         }
 
-        val library = if (isWebDl(catalogId)) {
-            metaLibrary(catalogId)
-        } else {
-            torzLibrary(catalogId)?.takeIf { it.entries.isNotEmpty() } ?: metaLibrary(catalogId)
-        }
+        val torz = torzLibrary(catalogId)
+        val library = torz?.takeIf { it.entries.any { entry -> entry.season != null } }
+            ?: metaLibrary(catalogId)
+            ?: torz?.takeIf { it.entries.isNotEmpty() }
+
+        Log.d(
+            TAG,
+            "library catalog=$catalogId webdl=${isWebDl(catalogId)} torzEntries=${torz?.entries?.size} " +
+                "torzSeasons=${torz?.entries?.mapNotNull { it.season }?.distinct()} " +
+                "used=entries:${library?.entries?.size} seasons:${library?.entries?.mapNotNull { it.season }?.distinct()}",
+        )
         if (library != null) {
             libraryCache[key] = library to (now + LIBRARY_CACHE_MS)
         }
@@ -428,11 +464,15 @@ abstract class PikPak :
         val isItemFolder = firstClean == itemClean ||
             (!firstLooksLikeSeason && firstClean.length >= 3 && itemClean.startsWith(firstClean))
 
-        return if (isItemFolder) {
+        val season = if (isItemFolder) {
             segments.getOrNull(1)?.takeIf { segments.size >= 3 }
         } else {
             first
         }
+        if (season == null && segments.size > 1) {
+            Log.d(TAG, "no season path=${file.path} item=$itemName segments=$segments")
+        }
+        return season
     }
 
     private fun videoFileName(video: MetaVideo): String = video.title.substringAfterLast('\n').removePrefix("📄 ").trim()
@@ -591,6 +631,7 @@ abstract class PikPak :
     )
 
     companion object {
+        private const val TAG = "PikPak"
         private const val STORE_NAME = "pikpak"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
