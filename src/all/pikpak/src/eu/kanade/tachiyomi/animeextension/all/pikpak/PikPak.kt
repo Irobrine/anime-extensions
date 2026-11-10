@@ -316,7 +316,11 @@ abstract class PikPak :
                 )
             }
 
-        val finalEntries = withOtherSeason(entries)
+        val withFileSeasons = assignFileNameSeasons(entries, listing.name)
+        val finalEntries = withOtherSeason(withFileSeasons)
+        if (finalEntries.none { it.season != null }) {
+            Log.d(TAG, "no seasons item=$itemId paths=${listing.files.take(8).map { it.path }}")
+        }
         Log.d(
             TAG,
             "direct item=$itemId files=${listing.files.size} videos=${finalEntries.size} " +
@@ -371,6 +375,45 @@ abstract class PikPak :
             Log.d(TAG, "no season path=$rawPath fallback=$fallbackName item=$itemName folders=$folders")
         }
         return season
+    }
+
+    private fun assignFileNameSeasons(entries: List<EpisodeEntry>, itemName: String): List<EpisodeEntry> {
+        if (entries.any { it.season != null }) return entries
+
+        val itemClean = cleanAnimeName(itemName).lowercase(Locale.US)
+        val prefixes = entries
+            .mapNotNull { fileNameSeasonPrefix(it.fileName) }
+            .distinctBy { it.lowercase(Locale.US) }
+            .filterNot { it.lowercase(Locale.US) == itemClean }
+
+        if (prefixes.size < 2) return entries
+
+        Log.d(TAG, "file-name season fallback item=$itemName prefixes=$prefixes")
+        return entries.map { entry ->
+            val prefix = fileNameSeasonPrefix(entry.fileName) ?: return@map entry
+            if (prefix.lowercase(Locale.US) == itemClean) entry else entry.copy(season = prefix)
+        }
+    }
+
+    private fun fileNameSeasonPrefix(fileName: String): String? {
+        val base = fileName.substringBeforeLast('.')
+        val markers = listOf(
+            SEASON_EPISODE_REGEX,
+            EPISODE_WORD_REGEX,
+            DASH_EPISODE_REGEX,
+            BRACKET_EPISODE_REGEX,
+            BRACKET_EXPLICIT_EPISODE_REGEX,
+            PAREN_EPISODE_REGEX,
+            PAREN_EXPLICIT_EPISODE_REGEX,
+            EXPLICIT_EPISODE_REGEX,
+            SPACE_EPISODE_REGEX,
+        )
+
+        val index = markers.mapNotNull { it.find(base)?.range?.first }.minOrNull() ?: return null
+        if (index <= 0) return null
+
+        val prefix = cleanAnimeName(base.substring(0, index)).trim()
+        return prefix.takeIf { it.isNotBlank() && !isVideoTypeTag(it) }
     }
 
     private fun withOtherSeason(entries: List<EpisodeEntry>): List<EpisodeEntry> {
