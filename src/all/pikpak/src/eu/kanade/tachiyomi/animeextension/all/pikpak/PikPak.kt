@@ -104,7 +104,6 @@ abstract class PikPak :
             anime.title = cleanAnimeName(library.name)
         }
         val seasons = library.entries.mapNotNull { it.season }.distinct()
-        anime.fetch_type = if (seasons.isNotEmpty()) FetchType.Seasons else FetchType.Episodes
         anime.initialized = true
         Log.d(TAG, "details item=$itemId seasons=$seasons type=${anime.fetch_type}")
         return anime
@@ -125,7 +124,21 @@ abstract class PikPak :
             .distinct()
             .sortedWith(compareBy<String> { seasonSortKey(it) }.thenBy { it })
         Log.d(TAG, "seasons item=$itemId seasons=$seasons")
-        if (seasons.isEmpty()) return emptyList()
+        if (seasons.isEmpty()) {
+            return listOf(
+                SAnime.create().apply {
+                    title = SYNTHETIC_SEASON_TITLE
+                    url = "$itemId$SEASON_SEPARATOR$SYNTHETIC_SEASON_ID"
+                    season_number = 1.0
+                    fetch_type = FetchType.Episodes
+                    initialized = true
+                    thumbnail_url = anime.thumbnail_url
+                    description = anime.description
+                    genre = anime.genre
+                    status = anime.status
+                },
+            )
+        }
 
         return seasons.map { label ->
             SAnime.create().apply {
@@ -153,7 +166,7 @@ abstract class PikPak :
         val (itemId, seasonFilter) = parseSeasonUrl(anime.url)
         val library = libraryFor(itemId)
 
-        val filtered = if (seasonFilter == null) {
+        val filtered = if (seasonFilter == null || seasonFilter == SYNTHETIC_SEASON_ID) {
             library.entries
         } else {
             library.entries.filter { it.season == seasonFilter }
@@ -271,6 +284,7 @@ abstract class PikPak :
             SAnime.create().apply {
                 title = cleanAnimeName(item.name).ifBlank { item.id }
                 url = item.id
+                fetch_type = if (item.kind == KIND_FOLDER) FetchType.Seasons else FetchType.Episodes
                 description = if (item.params?.url?.startsWith("magnet:", ignoreCase = true) == true) {
                     "PikPak torrent • $BUILD_TAG"
                 } else {
@@ -449,7 +463,7 @@ abstract class PikPak :
 
     private fun seasonNumberFromLabel(season: String): Double {
         val key = seasonSortKey(season)
-        return if (key == Int.MAX_VALUE) 0.0 else key.toDouble()
+        return if (key == Int.MAX_VALUE) -1.0 else key.toDouble()
     }
 
     private fun parseSeasonUrl(url: String): Pair<String, String?> {
@@ -576,7 +590,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v2"
+        private const val BUILD_TAG = "direct-v3"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_TORRENTS_KEY = "show_torrents"
@@ -584,6 +598,9 @@ abstract class PikPak :
 
         private const val SEASON_SEPARATOR = "|"
         private const val OTHER_SEASON = "Other"
+        private const val SYNTHETIC_SEASON_ID = "__episodes__"
+        private const val SYNTHETIC_SEASON_TITLE = "Episodes"
+        private const val KIND_FOLDER = "drive#folder"
 
         private const val CATALOG_CACHE_MS = 5_000L
         private const val LIBRARY_CACHE_MS = 2_000L
