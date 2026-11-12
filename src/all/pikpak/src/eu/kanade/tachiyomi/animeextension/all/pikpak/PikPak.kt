@@ -20,6 +20,9 @@ import keiyoushi.annotation.Source
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
@@ -52,6 +55,12 @@ abstract class PikPak :
 
     @Volatile
     private var directClient: PikPakClient? = null
+
+    @Volatile
+    private var metadataClientKey: String? = null
+
+    @Volatile
+    private var metadataClient: MetadataClient? = null
 
     // ============================== Popular ===============================
 
@@ -104,6 +113,10 @@ abstract class PikPak :
             anime.title = cleanAnimeName(library.name)
         }
         val seasons = library.entries.mapNotNull { it.season }.distinct()
+        if (preferences.getBoolean(PREF_METADATA_KEY, true)) {
+            val metadata = fetchMetadata(library.name, season)
+            if (metadata != null) applyMetadata(anime, metadata)
+        }
         anime.initialized = true
         Log.d(TAG, "details item=$itemId seasons=$seasons type=${anime.fetch_type}")
         return anime
@@ -140,18 +153,27 @@ abstract class PikPak :
             )
         }
 
-        return seasons.map { label ->
-            SAnime.create().apply {
-                title = label
-                url = "$itemId$SEASON_SEPARATOR$label"
-                season_number = seasonNumberFromLabel(label)
-                fetch_type = FetchType.Episodes
-                initialized = true
-                thumbnail_url = anime.thumbnail_url
-                description = anime.description
-                genre = anime.genre
-                status = anime.status
-            }
+        val metadataEnabled = preferences.getBoolean(PREF_METADATA_KEY, true)
+        return coroutineScope {
+            seasons.map { label ->
+                async {
+                    SAnime.create().apply {
+                        title = label
+                        url = "$itemId$SEASON_SEPARATOR$label"
+                        season_number = seasonNumberFromLabel(label)
+                        fetch_type = FetchType.Episodes
+                        initialized = true
+                        thumbnail_url = anime.thumbnail_url
+                        description = anime.description
+                        genre = anime.genre
+                        status = anime.status
+                        if (metadataEnabled) {
+                            val metadata = fetchMetadata(library.name, label)
+                            if (metadata != null) applyMetadata(this, metadata)
+                        }
+                    }
+                }
+            }.awaitAll()
         }
     }
 
@@ -166,6 +188,13 @@ abstract class PikPak :
         val (itemId, seasonFilter) = parseSeasonUrl(anime.url)
         val library = libraryFor(itemId)
 
+        val metadata = if (preferences.getBoolean(PREF_METADATA_KEY, true)) {
+            val metadataSeason = seasonFilter?.takeUnless { it == SYNTHETIC_SEASON_ID }
+            fetchMetadata(library.name, metadataSeason)
+        } else {
+            null
+        }
+
         val filtered = if (seasonFilter == null || seasonFilter == SYNTHETIC_SEASON_ID) {
             library.entries
         } else {
@@ -174,7 +203,7 @@ abstract class PikPak :
 
         val numbered = filtered
             .sortedBy { it.fileName }
-            .map { entry -> entry to entry.episode }
+            .map { entry -> entry to (entry.episode ?: metadata?.resolveEpisodeNumber(entry.fileName)) }
         var nextEpisode = (numbered.mapNotNull { it.second }.maxOrNull() ?: 0) + 1
         val resolved = numbered.map { (entry, number) ->
             val episode = number ?: nextEpisode++
@@ -349,6 +378,105 @@ abstract class PikPak :
                 "seasons=${finalEntries.mapNotNull { it.season }.distinct()}",
         )
         return Library(listing.name, finalEntries)
+    }
+
+    @Synchronized
+    private fun metadataClient(): MetadataClient {
+        val key = preferences.getString(PREF_TMDB_KEY, "").orEmpty().trim()
+        metadataClient?.takeIf { metadataClientKey == key }?.let { return it }
+
+        return MetadataClient(client, key).also {
+            metadataClient = it
+            metadataClientKey = key
+        }
+    }
+
+    private suspend fun fetchMetadata(parentTitle: String, season: String?): AnimeMetadata? {
+        val parent = cleanAnimeName(parentTitle)
+        if (parent.isBlank()) return null
+
+        val query = metadataQuery(parent, season)
+        val tmdbSeason = season?.let { seasonNumberForTmdb(it) }
+        val metadata = metadataClient().fetch(query, tmdbSeason)
+            ?: if (season != null) metadataClient().fetch(parent, null) else null
+
+        Log.d(TAG, "metadata query=$query season=$season found=${metadata != null}")
+        return metadata
+    }
+
+    private fun metadataQuery(parent: String, season: String?): String {
+        if (season.isNullOrBlank() || season == SYNTHETIC_SEASON_ID) return parent
+
+        val label = cleanAnimeName(season).ifBlank { season }
+        val key = seasonSortKey(season)
+        val suffix = when {
+            season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true) -> "Special"
+            key == 0 -> "Season 0"
+            key != Int.MAX_VALUE -> "Season $key"
+            else -> label
+        }
+        return "$parent $suffix"
+    }
+
+    private fun seasonNumberForTmdb(season: String): Int? {
+        val number = seasonSortKey(season)
+        return number.takeIf { it in 0..50 }
+    }
+
+    private fun applyMetadata(anime: SAnime, metadata: AnimeMetadata) {
+        metadata.coverUrl?.takeIf { it.isNotBlank() }?.let { anime.thumbnail_url = it }
+        metadata.bannerUrl?.takeIf { it.isNotBlank() }?.let { anime.background_url = it }
+        anime.author = metadata.studios.joinToString(", ").takeIf { it.isNotBlank() }
+        anime.genre = metadata.genres.joinToString(", ").takeIf { it.isNotBlank() }
+        anime.status = mapStatus(metadata.status)
+        anime.description = buildMetadataDescription(metadata)
+    }
+
+    private fun buildMetadataDescription(metadata: AnimeMetadata): String {
+        val parts = mutableListOf<String>()
+        metadata.description?.takeIf { it.isNotBlank() }?.let { parts += it.trim() }
+
+        if (metadata.characters.isNotEmpty()) {
+            parts += buildString {
+                append("Characters:")
+                metadata.characters.forEach { character ->
+                    append("\n• ").append(character.name)
+                    character.detail?.takeIf { it.isNotBlank() }?.let {
+                        append(" (").append(it).append(")")
+                    }
+                }
+            }
+        }
+
+        if (metadata.recommendations.isNotEmpty()) {
+            parts += buildString {
+                append("Recommendations:")
+                metadata.recommendations.forEach { append("\n• ").append(it.title) }
+            }
+        }
+
+        if (metadata.related.isNotEmpty()) {
+            parts += buildString {
+                append("Related:")
+                metadata.related.forEach { suggestion ->
+                    append("\n• ").append(suggestion.title)
+                    suggestion.label?.takeIf { it.isNotBlank() }?.let {
+                        append(" (").append(it).append(")")
+                    }
+                }
+            }
+        }
+
+        return parts.joinToString("\n\n")
+    }
+
+    private fun mapStatus(status: String?): Int = when (status?.uppercase(Locale.US)) {
+        "FINISHED", "ENDED" -> SAnime.COMPLETED
+        "RELEASING", "RETURNING SERIES" -> SAnime.ONGOING
+        "NOT_YET_RELEASED", "PLANNED", "IN PRODUCTION" -> SAnime.ONGOING
+        "CANCELLED", "CANCELED" -> SAnime.CANCELLED
+        "HIATUS" -> SAnime.ON_HIATUS
+        else -> SAnime.UNKNOWN
     }
 
     @Synchronized
@@ -572,6 +700,29 @@ abstract class PikPak :
                 preferences.edit().putBoolean(key, newValue as Boolean).commit()
             }
         }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_METADATA_KEY
+            title = "Fetch anime metadata"
+            summary = "Use AniList for covers, studio, characters and suggestions. TMDB is used as fallback."
+            setDefaultValue(true)
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit().putBoolean(key, newValue as Boolean).commit()
+            }
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_TMDB_KEY
+            title = "TMDB API key (optional)"
+            summary = "Used when AniList has no match, especially for movies and TV shows."
+            setDefaultValue("")
+            setOnBindEditTextListener { editText ->
+                editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit().putString(key, (newValue as String).trim()).commit()
+            }
+        }.also(screen::addPreference)
     }
 
     private data class Library(
@@ -590,11 +741,13 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v3"
+        private const val BUILD_TAG = "direct-v4"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
+        private const val PREF_METADATA_KEY = "fetch_metadata"
+        private const val PREF_TMDB_KEY = "tmdb_api_key"
 
         private const val SEASON_SEPARATOR = "|"
         private const val OTHER_SEASON = "Other"
