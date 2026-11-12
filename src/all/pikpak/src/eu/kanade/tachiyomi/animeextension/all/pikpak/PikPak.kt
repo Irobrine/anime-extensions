@@ -682,6 +682,10 @@ abstract class PikPak :
                 .putLong(PREF_TOKEN_EXPIRES_AT, tokens.expiresAt)
                 .commit()
         }
+
+        override fun clearRefreshSeed() {
+            preferences.edit().remove(PREF_REFRESH_TOKEN_INPUT).commit()
+        }
     }
 
     private fun clearStoredTokens() {
@@ -1056,7 +1060,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v14"
+        private const val BUILD_TAG = "direct-v15"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"

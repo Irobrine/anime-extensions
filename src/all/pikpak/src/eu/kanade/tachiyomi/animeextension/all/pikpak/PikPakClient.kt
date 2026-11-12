@@ -44,6 +44,9 @@ internal class PikPakClient(
     interface TokenStore {
         fun load(): StoredTokens?
         fun save(tokens: StoredTokens)
+
+        /** Drops a refresh token pasted from the web session after PikPak rejects it. */
+        fun clearRefreshSeed() = Unit
     }
 
     data class StoredTokens(
@@ -92,6 +95,7 @@ internal class PikPakClient(
     private var driveCaptchaExpiresAt: Long = 0
 
     private val hasRefreshSeed = !refreshSeed.isNullOrBlank()
+    private var refreshSource: String = "none"
 
     init {
         val stored = tokenStore.load()
@@ -100,9 +104,11 @@ internal class PikPakClient(
             refreshToken = stored.refreshToken
             userId = stored.userId
             expiresAt = stored.expiresAt
+            refreshSource = "stored"
         } else {
             // A refresh token pasted from the web session avoids the login captcha entirely.
             refreshToken = refreshSeed?.takeIf { it.isNotBlank() }
+            refreshSource = if (refreshToken != null) "seed" else "none"
         }
     }
 
@@ -347,18 +353,37 @@ internal class PikPakClient(
 
         if (refreshLocked()) return
 
+        if (hasRefreshSeed && isRefreshTokenRejected()) {
+            // PikPak rotates refresh tokens, so a pasted one is often already dead.
+            // Do not let it block the account login that can still work.
+            Log.d(AUTH_TAG, "refresh seed rejected, falling back to account login: $lastRefreshError")
+            tokenStore.clearRefreshSeed()
+            refreshToken = null
+            expiresAt = 0
+            try {
+                signInLocked()
+                return
+            } catch (e: IOException) {
+                val savedError = lastRefreshError?.let { " Saved token error: $it." }.orEmpty()
+                throw IOException(
+                    "PikPak rejected the saved refresh token and the account sign-in failed too: " +
+                        "${e.message}.$savedError Copy a fresh refresh token from mypikpak.com, " +
+                        "or wait for PikPak's login rate limit to expire.",
+                    e,
+                )
+            }
+        }
+
         if (hasRefreshSeed) {
-            val detail = lastRefreshError?.let { " The server said: $it." }.orEmpty()
-            throw IOException(
-                "PikPak rejected the refresh token.$detail " +
-                    "Refresh tokens are single-use: PikPak rotates them on every refresh and the web app " +
-                    "rotates them in the background while mypikpak.com is open. Log in at mypikpak.com, " +
-                    "copy refresh_token from DevTools > Application > Local Storage > credentials, " +
-                    "close the web tab without logging out, then paste it in the extension settings.",
-            )
+            throw IOException("Could not refresh the PikPak session: $lastRefreshError")
         }
 
         signInLocked()
+    }
+
+    private fun isRefreshTokenRejected(): Boolean {
+        val error = lastRefreshError ?: return false
+        return error.contains("invalid_grant", ignoreCase = true) || error.contains("4126")
     }
 
     private suspend fun ensureDriveCaptchaLocked(action: String) {
@@ -463,6 +488,7 @@ internal class PikPakClient(
         client.post(url, clientHeaders(includeAuth = accessToken != null), body, ensureSuccess = false)
             .use { response ->
                 val text = response.body.string()
+                Log.d(AUTH_TAG, "refresh attempt source=$refreshSource tokenLen=${token.length} code=${response.code}")
                 if (!response.isSuccessful) {
                     lastRefreshError = "HTTP ${response.code}: ${text.take(300)}"
                     Log.d(AUTH_TAG, "refresh failed tokenLen=${token.length} $lastRefreshError")
@@ -486,6 +512,7 @@ internal class PikPakClient(
                 }
                 expiresAt = nowSeconds() + data.expiresIn
                 lastRefreshError = null
+                refreshSource = "rotated"
                 persistTokens()
                 Log.d(AUTH_TAG, "refresh ok tokenLen=${token.length} newTokenLen=${refreshToken.orEmpty().length}")
                 return true
