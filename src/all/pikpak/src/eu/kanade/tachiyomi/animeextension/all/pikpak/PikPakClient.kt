@@ -157,6 +157,48 @@ internal class PikPakClient(
             ?: file.webContentLink?.takeIf { it.isNotBlank() }
     }
 
+    /**
+     * Resolves a folder ID or a path such as `My Shared/Anime` to a folder.
+     * Paths are matched by name, starting at the drive root (so `My Pack/...`
+     * works) or at My Pack when the first segment is not a root folder.
+     */
+    suspend fun resolveFolder(input: String): PikPakFile? = mutex.withLock {
+        ensureAuthLocked()
+
+        val cleaned = input.trim().trim('/')
+        if (cleaned.isBlank()) return null
+
+        if (ID_HINT_REGEX.matches(cleaned)) {
+            runCatching { getFileLocked(cleaned) }
+                .getOrNull()
+                ?.takeIf { it.kind == KIND_FOLDER && it.id.isNotBlank() }
+                ?.let { return it }
+        }
+
+        val segments = cleaned.split('/').map { it.trim() }.filter { it.isNotBlank() }
+        if (segments.isEmpty()) return null
+
+        val rootFolders = listChildrenLocked("")
+            .filter { it.kind == KIND_FOLDER && it.id.isNotBlank() }
+
+        var folder = rootFolders.firstOrNull { it.name.equals(segments.first(), ignoreCase = true) }
+        var remaining = segments
+        if (folder != null) {
+            remaining = segments.drop(1)
+        } else {
+            folder = rootFolders.firstOrNull { it.name.equals("My Pack", ignoreCase = true) } ?: return null
+        }
+
+        for (segment in remaining) {
+            val parentId = folder?.id ?: return null
+            folder = listChildrenLocked(parentId).firstOrNull {
+                it.kind == KIND_FOLDER && it.name.equals(segment, ignoreCase = true)
+            } ?: return null
+        }
+
+        return folder
+    }
+
     private suspend fun listChildrenLocked(parentId: String): List<PikPakFile> {
         val result = mutableListOf<PikPakFile>()
         var pageToken = ""
@@ -507,6 +549,7 @@ internal class PikPakClient(
             """{"trashed":{"eq":false},"phase":{"eq":"PHASE_TYPE_COMPLETE"}}"""
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+        private val ID_HINT_REGEX = Regex("^[A-Za-z0-9_-]{16,}$")
         private val USER_BASE = "https://user.mypikpak.com".toHttpUrl()
         private val DRIVE_BASE = "https://api-drive.mypikpak.com".toHttpUrl()
         private val PHONE_REGEX = Regex("\\d{11,18}")

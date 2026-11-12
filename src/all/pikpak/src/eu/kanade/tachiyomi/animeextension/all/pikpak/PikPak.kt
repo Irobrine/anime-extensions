@@ -48,7 +48,8 @@ abstract class PikPak :
     private val preferences by getPreferencesLazy()
 
     private val libraryCache = ConcurrentHashMap<String, Pair<Library, Long>>()
-    private val catalogCache = ConcurrentHashMap<String, Pair<List<PikPakFile>, Long>>()
+    private val catalogCache = ConcurrentHashMap<String, Pair<List<CatalogItem>, Long>>()
+    private val extraFolderCache = ConcurrentHashMap<String, Pair<PikPakFile?, Long>>()
 
     @Volatile
     private var directClientAccount: String? = null
@@ -264,11 +265,13 @@ abstract class PikPak :
 
     // ============================== Catalog ===============================
 
-    private suspend fun myPack(): List<PikPakFile> {
-        val key = account()
+    private suspend fun myPack(): List<CatalogItem> {
+        val account = account()
+        val extras = extraFolders()
+        val key = "$account|${extras.joinToString("|")}"
         val now = System.currentTimeMillis()
         catalogCache[key]?.let { (items, expiresAt) ->
-            if (expiresAt > now) return filterCatalog(items)
+            if (expiresAt > now) return items
         }
 
         val client = directClient()
@@ -283,27 +286,69 @@ abstract class PikPak :
             throw IOException("Could not list PikPak My Pack: ${e.message}", e)
         }
 
-        Log.d(TAG, "my pack items=${items.size} build=$BUILD_TAG")
-        catalogCache[key] = items to (now + CATALOG_CACHE_MS)
-        return filterCatalog(items)
+        val pinned = extras.mapNotNull { resolveExtraFolder(client, it) }.distinctBy { it.id }
+        val pinnedIds = pinned.map { it.id }.toSet()
+        val combined = pinned + filterCatalog(items)
+            .map { it.toCatalogItem() }
+            .filterNot { it.id in pinnedIds }
+            .sortedWith(CATALOG_COMPARATOR)
+
+        Log.d(TAG, "my pack items=${items.size} extras=${pinned.size} build=$BUILD_TAG")
+        catalogCache[key] = combined to (now + CATALOG_CACHE_MS)
+        return combined
     }
+
+    private suspend fun resolveExtraFolder(client: PikPakClient, input: String): CatalogItem? {
+        val now = System.currentTimeMillis()
+        extraFolderCache[input]?.let { (folder, expiresAt) ->
+            if (expiresAt > now) return folder?.toCatalogItem(pinned = true)
+        }
+
+        val folder = try {
+            client.resolveFolder(input)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "extra folder '$input' error=${e.message}")
+            null
+        }
+
+        extraFolderCache[input] = folder to (now + if (folder != null) EXTRA_FOLDER_CACHE_MS else EXTRA_FOLDER_MISS_MS)
+        if (folder != null) {
+            Log.d(TAG, "extra folder '$input' -> '${folder.name}' id=${folder.id}")
+        } else {
+            Log.d(TAG, "extra folder '$input' not found")
+        }
+        return folder?.toCatalogItem(pinned = true)
+    }
+
+    private fun extraFolders(): List<String> = preferences.getString(PREF_EXTRA_FOLDERS, "")
+        .orEmpty()
+        .split(',', ';', '\n', '\r')
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+
+    private fun PikPakFile.toCatalogItem(pinned: Boolean = false) = CatalogItem(
+        id = id,
+        name = name,
+        isFolder = kind == KIND_FOLDER,
+        isTorrent = params?.url?.startsWith("magnet:", ignoreCase = true) == true,
+        isPinned = pinned,
+        createdTime = createdTime,
+        thumbnail = thumbnailLink,
+    )
 
     private fun filterCatalog(items: List<PikPakFile>): List<PikPakFile> {
         val showTorrents = preferences.getBoolean(PREF_TORRENTS_KEY, true)
         val showWebDownloads = preferences.getBoolean(PREF_WEB_DOWNLOADS_KEY, true)
 
-        return items
-            .filter { item ->
-                val isTorrent = item.params?.url?.startsWith("magnet:", ignoreCase = true) == true
-                if (isTorrent) showTorrents else showWebDownloads
-            }
-            .sortedWith(
-                compareByDescending<PikPakFile> { it.createdTime.orEmpty() }
-                    .thenBy { it.name.lowercase(Locale.US) },
-            )
+        return items.filter { item ->
+            val isTorrent = item.params?.url?.startsWith("magnet:", ignoreCase = true) == true
+            if (isTorrent) showTorrents else showWebDownloads
+        }
     }
 
-    private fun catalogPage(items: List<PikPakFile>, page: Int): AnimesPage {
+    private fun catalogPage(items: List<CatalogItem>, page: Int): AnimesPage {
         val start = (page - 1) * PAGE_SIZE
         if (start >= items.size) return AnimesPage(emptyList(), false)
 
@@ -312,13 +357,13 @@ abstract class PikPak :
             SAnime.create().apply {
                 title = cleanAnimeName(item.name).ifBlank { item.id }
                 url = item.id
-                fetch_type = if (item.kind == KIND_FOLDER) FetchType.Seasons else FetchType.Episodes
-                description = if (item.params?.url?.startsWith("magnet:", ignoreCase = true) == true) {
-                    "PikPak torrent • $BUILD_TAG"
-                } else {
-                    "PikPak file • $BUILD_TAG"
+                fetch_type = if (item.isFolder) FetchType.Seasons else FetchType.Episodes
+                description = when {
+                    item.isPinned -> "PikPak extra folder • $BUILD_TAG"
+                    item.isTorrent -> "PikPak torrent • $BUILD_TAG"
+                    else -> "PikPak file • $BUILD_TAG"
                 }
-                thumbnail_url = item.thumbnailLink?.takeIf { it.isNotBlank() } ?: FALLBACK_POSTER
+                thumbnail_url = item.thumbnail?.takeIf { it.isNotBlank() } ?: FALLBACK_POSTER
             }
         }
 
@@ -763,6 +808,7 @@ abstract class PikPak :
                 val value = (newValue as String).trim()
                 catalogCache.clear()
                 libraryCache.clear()
+                extraFolderCache.clear()
                 directClient = null
                 directClientAccount = null
                 clearStoredTokens()
@@ -787,6 +833,20 @@ abstract class PikPak :
             setDefaultValue(true)
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putBoolean(key, newValue as Boolean).commit()
+            }
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_EXTRA_FOLDERS
+            title = "Extra folders"
+            summary = "Folder IDs or paths to add to the catalog, separated by commas. Example: My Shared/Anime"
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit().putString(key, (newValue as String).trim()).commit()
+                catalogCache.clear()
+                libraryCache.clear()
+                extraFolderCache.clear()
+                true
             }
         }.also(screen::addPreference)
 
@@ -819,6 +879,16 @@ abstract class PikPak :
         val entries: List<EpisodeEntry>,
     )
 
+    private data class CatalogItem(
+        val id: String,
+        val name: String,
+        val isFolder: Boolean,
+        val isTorrent: Boolean,
+        val isPinned: Boolean = false,
+        val createdTime: String? = null,
+        val thumbnail: String? = null,
+    )
+
     private data class EpisodeEntry(
         val fileName: String,
         val fileId: String,
@@ -830,9 +900,10 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v6"
+        private const val BUILD_TAG = "direct-v7"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
+        private const val PREF_EXTRA_FOLDERS = "pikpak_extra_folders"
         private const val PREF_ACCESS_TOKEN = "pikpak_access_token"
         private const val PREF_REFRESH_TOKEN = "pikpak_refresh_token"
         private const val PREF_USER_ID = "pikpak_user_id"
@@ -850,7 +921,13 @@ abstract class PikPak :
 
         private const val CATALOG_CACHE_MS = 5_000L
         private const val LIBRARY_CACHE_MS = 2_000L
+        private const val EXTRA_FOLDER_CACHE_MS = 10 * 60 * 1000L
+        private const val EXTRA_FOLDER_MISS_MS = 60 * 1000L
         private const val PAGE_SIZE = 100
+
+        private val CATALOG_COMPARATOR = compareBy<CatalogItem> { if (it.isPinned) 0 else 1 }
+            .thenByDescending { it.createdTime.orEmpty() }
+            .thenBy { it.name.lowercase(Locale.US) }
 
         private const val FALLBACK_POSTER = "https://mypikpak.com/android-chrome-192x192.png"
 
