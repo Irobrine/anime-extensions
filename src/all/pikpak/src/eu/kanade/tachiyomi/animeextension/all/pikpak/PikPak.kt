@@ -962,7 +962,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v10"
+        private const val BUILD_TAG = "direct-v11"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"

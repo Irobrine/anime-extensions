@@ -76,6 +76,8 @@ internal class PikPakClient(
     private val json = Json {
         ignoreUnknownKeys = true
         explicitNulls = false
+        // Fields such as grant_type have defaults; the API requires them in the body.
+        encodeDefaults = true
     }
 
     private val deviceId = getDeviceId("$username:$password")
