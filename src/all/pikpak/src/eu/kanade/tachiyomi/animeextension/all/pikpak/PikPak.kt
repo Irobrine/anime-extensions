@@ -569,6 +569,9 @@ abstract class PikPak :
 
     private fun tokenStore(): PikPakClient.TokenStore = object : PikPakClient.TokenStore {
         override fun load(): PikPakClient.StoredTokens? {
+            val version = preferences.getString(PREF_TOKEN_CLIENT, "").orEmpty()
+            if (version != TOKEN_STORE_VERSION) return null
+
             val access = preferences.getString(PREF_ACCESS_TOKEN, "").orEmpty()
             val refresh = preferences.getString(PREF_REFRESH_TOKEN, "").orEmpty()
             if (access.isBlank() || refresh.isBlank()) return null
@@ -583,6 +586,7 @@ abstract class PikPak :
 
         override fun save(tokens: PikPakClient.StoredTokens) {
             preferences.edit()
+                .putString(PREF_TOKEN_CLIENT, TOKEN_STORE_VERSION)
                 .putString(PREF_ACCESS_TOKEN, tokens.accessToken)
                 .putString(PREF_REFRESH_TOKEN, tokens.refreshToken)
                 .putString(PREF_USER_ID, tokens.userId)
@@ -593,6 +597,7 @@ abstract class PikPak :
 
     private fun clearStoredTokens() {
         preferences.edit()
+            .remove(PREF_TOKEN_CLIENT)
             .remove(PREF_ACCESS_TOKEN)
             .remove(PREF_REFRESH_TOKEN)
             .remove(PREF_USER_ID)
@@ -900,7 +905,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v7"
+        private const val BUILD_TAG = "direct-v8"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_EXTRA_FOLDERS = "pikpak_extra_folders"
@@ -908,6 +913,8 @@ abstract class PikPak :
         private const val PREF_REFRESH_TOKEN = "pikpak_refresh_token"
         private const val PREF_USER_ID = "pikpak_user_id"
         private const val PREF_TOKEN_EXPIRES_AT = "pikpak_token_expires_at"
+        private const val PREF_TOKEN_CLIENT = "pikpak_token_client"
+        private const val TOKEN_STORE_VERSION = "web-v1"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
         private const val PREF_METADATA_KEY = "fetch_metadata"

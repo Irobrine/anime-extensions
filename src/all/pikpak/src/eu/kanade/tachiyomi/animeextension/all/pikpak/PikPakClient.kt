@@ -9,6 +9,7 @@ import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFile
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFileListResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakMedia
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakRefreshRequest
+import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakSignInRequest
 import keiyoushi.network.get
 import keiyoushi.network.post
 import kotlinx.coroutines.delay
@@ -18,7 +19,6 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.CacheControl
-import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -300,7 +300,8 @@ internal class PikPakClient(
     }
 
     private suspend fun driveGet(url: HttpUrl): okhttp3.Response {
-        ensureDriveCaptchaLocked()
+        val action = "GET:${url.encodedPath}"
+        ensureDriveCaptchaLocked(action)
         var response = client.get(
             url,
             driveHeaders(),
@@ -313,7 +314,7 @@ internal class PikPakClient(
             ensureAuthLocked(forceRefresh = true)
             driveCaptcha = null
             driveCaptchaExpiresAt = 0
-            ensureDriveCaptchaLocked()
+            ensureDriveCaptchaLocked(action)
             response = client.get(
                 url,
                 driveHeaders(),
@@ -332,12 +333,12 @@ internal class PikPakClient(
         signInLocked()
     }
 
-    private suspend fun ensureDriveCaptchaLocked() {
+    private suspend fun ensureDriveCaptchaLocked(action: String) {
         val now = nowSeconds()
         if (driveCaptcha != null && now < driveCaptchaExpiresAt - 30) return
 
         val captcha = initCaptchaLocked(
-            action = DRIVE_CAPTCHA_ACTION,
+            action = action,
             loginIdentifier = null,
             userId = userId,
         )
@@ -375,13 +376,8 @@ internal class PikPakClient(
             userId = null,
         )
 
-        val form = FormBody.Builder()
-            .add("captcha_token", captcha.captchaToken)
-            .add("client_id", CLIENT_ID)
-            .add("client_secret", CLIENT_SECRET)
-            .add("password", password)
-            .add("username", username)
-            .build()
+        val form = json.encodeToString(PikPakSignInRequest(username, password, CLIENT_ID))
+            .toRequestBody(JSON_MEDIA_TYPE)
 
         val url = USER_BASE.newBuilder()
             .addPathSegment("v1")
@@ -389,10 +385,20 @@ internal class PikPakClient(
             .addPathSegment("signin")
             .build()
 
-        client.post(url, clientHeaders(), form, ensureSuccess = false).use { response ->
+        client.post(
+            url,
+            clientHeaders(captchaToken = captcha.captchaToken),
+            form,
+            ensureSuccess = false,
+        ).use { response ->
             val body = response.body.string()
             if (!response.isSuccessful) {
-                throw IOException("PikPak sign in HTTP ${response.code}: $body")
+                val failure = runCatching { json.decodeFromString<PikPakAuthResponse>(body) }.getOrNull()
+                val reason = failure?.errorDescription
+                    ?.takeIf { it.isNotBlank() }
+                    ?: failure?.error?.takeIf { it.isNotBlank() }
+                    ?: body
+                throw IOException("PikPak sign in HTTP ${response.code}: $reason")
             }
 
             val data = json.decodeFromString<PikPakAuthResponse>(body)
@@ -450,20 +456,26 @@ internal class PikPakClient(
         loginIdentifier: String?,
         userId: String?,
     ): PikPakCaptchaResponse {
-        val timestamp = System.currentTimeMillis().toString()
         val isEmail = loginIdentifier?.contains('@') == true
         val isPhone = loginIdentifier != null && !isEmail && PHONE_REGEX.matches(loginIdentifier)
 
-        val meta = PikPakCaptchaMeta(
-            username = loginIdentifier?.takeIf { !isEmail && !isPhone },
-            email = loginIdentifier?.takeIf { isEmail },
-            phoneNumber = loginIdentifier?.takeIf { isPhone },
-            captchaSign = calculateCaptchaSign(deviceId, timestamp),
-            clientVersion = CLIENT_VERSION,
-            packageName = PACKAGE_NAME,
-            timestamp = timestamp,
-            userId = userId,
-        )
+        val meta = if (action == LOGIN_CAPTCHA_ACTION) {
+            // The web login client only sends the identifier for the sign-in action.
+            PikPakCaptchaMeta(
+                username = loginIdentifier?.takeIf { !isEmail && !isPhone },
+                email = loginIdentifier?.takeIf { isEmail },
+                phoneNumber = loginIdentifier?.takeIf { isPhone },
+            )
+        } else {
+            val timestamp = System.currentTimeMillis().toString()
+            PikPakCaptchaMeta(
+                captchaSign = calculateCaptchaSign(deviceId, timestamp),
+                clientVersion = CLIENT_VERSION,
+                packageName = PACKAGE_NAME,
+                timestamp = timestamp,
+                userId = userId,
+            )
+        }
 
         val requestBody = json.encodeToString(PikPakCaptchaRequest(action, CLIENT_ID, deviceId, meta))
             .toRequestBody(JSON_MEDIA_TYPE)
@@ -507,17 +519,20 @@ internal class PikPakClient(
             .add("X-Client-Version", CLIENT_VERSION)
             .add("X-Device-Id", deviceId)
             .add("X-Captcha-Token", captcha)
-            .add("User-Agent", buildUserAgent(deviceId, userId.orEmpty()))
+            .add("Referer", REFERER)
+            .add("User-Agent", BROWSER_UA)
             .build()
     }
 
-    private fun clientHeaders(includeAuth: Boolean = false): Headers {
+    private fun clientHeaders(includeAuth: Boolean = false, captchaToken: String? = null): Headers {
         val builder = Headers.Builder()
             .add("X-Client-Id", CLIENT_ID)
             .add("X-Client-Version", CLIENT_VERSION)
             .add("X-Device-Id", deviceId)
+            .add("Referer", REFERER)
             .add("User-Agent", BROWSER_UA)
 
+        captchaToken?.takeIf { it.isNotBlank() }?.let { builder.add("X-Captcha-Token", it) }
         if (includeAuth) {
             accessToken?.let { builder.add("Authorization", "Bearer $it") }
         }
@@ -525,11 +540,11 @@ internal class PikPakClient(
     }
 
     companion object {
-        private const val CLIENT_ID = "YNxT9w7GMdWvEOKa"
-        private const val CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
-        private const val CLIENT_VERSION = "1.47.1"
-        private const val PACKAGE_NAME = "com.pikcloud.pikpak"
-        private const val SDK_VERSION = "2.0.4.204000"
+        // Identity of PikPak's web client, the same one a browser uses at mypikpak.com.
+        private const val CLIENT_ID = "YUMx5nI8ZU8Ap8pm"
+        private const val CLIENT_VERSION = "2.0.0"
+        private const val PACKAGE_NAME = "mypikpak.com"
+        private const val REFERER = "https://mypikpak.com/"
         private const val AUTH_TAG = "PikPakAuth"
         private const val MAX_SIGNIN_ATTEMPTS = 3
         private const val SIGNIN_RETRY_DELAY_MS = 3_000L
@@ -537,13 +552,11 @@ internal class PikPakClient(
         private const val KIND_FOLDER = "drive#folder"
         private const val PHASE_COMPLETE = "PHASE_TYPE_COMPLETE"
         private const val LOGIN_CAPTCHA_ACTION = "POST:/v1/auth/signin"
-        private const val DRIVE_CAPTCHA_ACTION = "POST:/config/v1/basic"
         private const val MAX_DEPTH = 10
         private const val MAX_PAGES = 200
 
         private const val BROWSER_UA =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0"
 
         private const val FILTERS_JSON =
             """{"trashed":{"eq":false},"phase":{"eq":"PHASE_TYPE_COMPLETE"}}"""
@@ -555,21 +568,21 @@ internal class PikPakClient(
         private val PHONE_REGEX = Regex("\\d{11,18}")
 
         private val MD5_SALTS = listOf(
-            "Gez0T9ijiI9WCeTsKSg3SMlx",
-            "zQdbalsolyb1R/",
-            "ftOjr52zt51JD68C3s",
-            "yeOBMH0JkbQdEFNNwQ0RI9T3wU/v",
-            "BRJrQZiTQ65WtMvwO",
-            "je8fqxKPdQVJiy1DM6Bc9Nb1",
-            "niV",
-            "9hFCW2R1",
-            "sHKHpe2i96",
-            "p7c5E6AcXQ/IJUuAEC9W6",
+            "C9qPpZLN8ucRTaTiUMWYS9cQvWOE",
+            "+r6CQVxjzJV6LCV",
+            "F",
+            "pFJRC",
+            "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt",
+            "/750aCr4lm/Sly/c",
+            "RB+DT/gZCrbV",
             "",
-            "aRv9hjc9P+Pbn+u3krN6",
-            "BzStcgE8qVdqjEH16l4",
-            "SqgeZvL5j9zoHP95xWHt",
-            "zVof5yaJkPe3VFpadPof",
+            "CyLsf7hdkIRxRm215hl",
+            "7xHvLi2tOYP0Y92b",
+            "ZGTXXxu8E/MIWaEDB+Sm/",
+            "1UI3",
+            "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO",
+            "ihtqpG6FMt65+Xk+tWUH2",
+            "NhXXU9rg4XXdzo7u5o",
         )
 
         private fun nowSeconds(): Long = System.currentTimeMillis() / 1000
@@ -591,40 +604,7 @@ internal class PikPakClient(
             return "1.$sign"
         }
 
-        private fun buildUserAgent(deviceId: String, userId: String): String {
-            val deviceSign = "div101.$deviceId" + md5(sha1(deviceId + PACKAGE_NAME + "1appkey"))
-            return listOf(
-                "ANDROID-$PACKAGE_NAME/$CLIENT_VERSION",
-                "protocolVersion/200",
-                "accesstype/",
-                "clientid/$CLIENT_ID",
-                "clientversion/$CLIENT_VERSION",
-                "action_type/",
-                "networktype/WIFI",
-                "sessionid/",
-                "deviceid/$deviceId",
-                "providername/NONE",
-                "devicesign/$deviceSign",
-                "refresh_token/",
-                "sdkversion/$SDK_VERSION",
-                "datetime/${System.currentTimeMillis()}",
-                "usrno/$userId",
-                "appname/$PACKAGE_NAME",
-                "session_origin/",
-                "grant_type/",
-                "appid/",
-                "clientip/",
-                "devicename/Xiaomi_M2004j7ac",
-                "osversion/13",
-                "platformversion/10",
-                "accessmode/",
-                "devicemodel/M2004J7AC",
-            ).joinToString(" ")
-        }
-
         private fun md5(value: String): String = MessageDigest.getInstance("MD5").digest(value.toByteArray(Charsets.UTF_8)).toHex()
-
-        private fun sha1(value: String): String = MessageDigest.getInstance("SHA-1").digest(value.toByteArray(Charsets.UTF_8)).toHex()
 
         private fun ByteArray.toHex(): String = joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
     }

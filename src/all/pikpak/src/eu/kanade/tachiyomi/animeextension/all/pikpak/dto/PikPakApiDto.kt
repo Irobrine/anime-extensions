@@ -16,10 +16,10 @@ data class PikPakCaptchaMeta(
     val username: String? = null,
     val email: String? = null,
     @SerialName("phone_number") val phoneNumber: String? = null,
-    @SerialName("captcha_sign") val captchaSign: String,
-    @SerialName("client_version") val clientVersion: String,
-    @SerialName("package_name") val packageName: String,
-    val timestamp: String,
+    @SerialName("captcha_sign") val captchaSign: String? = null,
+    @SerialName("client_version") val clientVersion: String? = null,
+    @SerialName("package_name") val packageName: String? = null,
+    val timestamp: String? = null,
     @SerialName("user_id") val userId: String? = null,
 )
 
@@ -48,6 +48,13 @@ data class PikPakRefreshRequest(
     @SerialName("refresh_token") val refreshToken: String,
     @SerialName("client_id") val clientId: String,
     @SerialName("grant_type") val grantType: String = "refresh_token",
+)
+
+@Serializable
+data class PikPakSignInRequest(
+    val username: String,
+    val password: String,
+    @SerialName("client_id") val clientId: String,
 )
 
 @Serializable
