@@ -578,19 +578,27 @@ abstract class PikPak :
             raw
         }
 
-        REFRESH_TOKEN_JSON_REGEX.find(decoded)?.groupValues?.get(1)?.let { return it }
+        val token = REFRESH_TOKEN_JSON_REGEX.find(decoded)?.groupValues?.get(1)
+            ?: run {
+                val tokenKey = "refresh_token="
+                val keyIndex = decoded.lowercase(Locale.US).indexOf(tokenKey)
+                if (keyIndex >= 0) {
+                    decoded.substring(keyIndex + tokenKey.length)
+                        .substringBefore('&')
+                        .substringBefore(';')
+                        .trim('"', ' ', '\'')
+                        .takeIf { it.isNotBlank() }
+                } else {
+                    decoded.takeIf { it.length >= 20 && !it.contains(' ') }
+                }
+            }
 
-        val tokenKey = "refresh_token="
-        val keyIndex = decoded.lowercase(Locale.US).indexOf(tokenKey)
-        if (keyIndex >= 0) {
-            return decoded.substring(keyIndex + tokenKey.length)
-                .substringBefore('&')
-                .substringBefore(';')
-                .trim('"', ' ', '\'')
-                .takeIf { it.isNotBlank() }
+        if (token != null) {
+            Log.d(TAG, "refresh token seed length=${token.length} prefix=${token.take(2)}")
+        } else {
+            Log.d(TAG, "refresh token seed could not be parsed length=${raw.length}")
         }
-
-        return decoded.takeIf { it.length >= 20 && !it.contains(' ') }
+        return token
     }
 
     private fun tokenStore(): PikPakClient.TokenStore = object : PikPakClient.TokenStore {
@@ -853,7 +861,7 @@ abstract class PikPak :
         EditTextPreference(screen.context).apply {
             key = PREF_REFRESH_TOKEN_INPUT
             title = "PikPak refresh token (optional)"
-            summary = "Skips the login captcha. Copy it from mypikpak.com: F12 > Application > Cookies > credentials."
+            summary = "Skips the login captcha. Copy refresh_token from mypikpak.com: F12 > Application > Local Storage > credentials."
             setDefaultValue("")
             setOnBindEditTextListener { editText ->
                 editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -954,7 +962,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v9"
+        private const val BUILD_TAG = "direct-v10"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"

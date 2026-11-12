@@ -339,10 +339,13 @@ internal class PikPakClient(
         if (refreshLocked()) return
 
         if (hasRefreshSeed) {
+            val detail = lastRefreshError?.let { " The server said: $it." }.orEmpty()
             throw IOException(
-                "PikPak needs a fresh refresh token: the saved one is invalid or expired. " +
-                    "Log in at mypikpak.com, open the browser dev tools (F12) and copy the refresh token " +
-                    "from the 'credentials' cookie into the extension settings.",
+                "PikPak rejected the refresh token.$detail " +
+                    "Refresh tokens are single-use: PikPak rotates them on every refresh and the web app " +
+                    "rotates them in the background while mypikpak.com is open. Log in at mypikpak.com, " +
+                    "copy refresh_token from DevTools > Application > Local Storage > credentials, " +
+                    "close the web tab without logging out, then paste it in the extension settings.",
             )
         }
 
@@ -434,6 +437,8 @@ internal class PikPakClient(
         }
     }
 
+    private var lastRefreshError: String? = null
+
     private suspend fun refreshLocked(): Boolean {
         val token = refreshToken ?: return false
 
@@ -448,12 +453,19 @@ internal class PikPakClient(
 
         client.post(url, clientHeaders(includeAuth = accessToken != null), body, ensureSuccess = false)
             .use { response ->
-                if (!response.isSuccessful) return false
-
                 val text = response.body.string()
+                if (!response.isSuccessful) {
+                    lastRefreshError = "HTTP ${response.code}: ${text.take(300)}"
+                    Log.d(AUTH_TAG, "refresh failed tokenLen=${token.length} $lastRefreshError")
+                    return false
+                }
+
                 val data = runCatching { json.decodeFromString<PikPakAuthResponse>(text) }.getOrNull()
-                    ?: return false
-                if (data.accessToken.isBlank()) return false
+                if (data == null || data.accessToken.isBlank()) {
+                    lastRefreshError = "unreadable token response: ${text.take(300)}"
+                    Log.d(AUTH_TAG, "refresh failed tokenLen=${token.length} $lastRefreshError")
+                    return false
+                }
 
                 accessToken = data.accessToken
                 refreshToken = data.refreshToken.ifBlank { token }
@@ -464,7 +476,9 @@ internal class PikPakClient(
                     driveCaptchaExpiresAt = 0
                 }
                 expiresAt = nowSeconds() + data.expiresIn
+                lastRefreshError = null
                 persistTokens()
+                Log.d(AUTH_TAG, "refresh ok tokenLen=${token.length} newTokenLen=${refreshToken.orEmpty().length}")
                 return true
             }
     }
