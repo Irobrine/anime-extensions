@@ -39,6 +39,7 @@ internal class PikPakClient(
     private val username: String,
     private val password: String,
     private val tokenStore: TokenStore = NoOpTokenStore,
+    refreshSeed: String? = null,
 ) {
     interface TokenStore {
         fun load(): StoredTokens?
@@ -88,12 +89,18 @@ internal class PikPakClient(
     private var driveCaptcha: String? = null
     private var driveCaptchaExpiresAt: Long = 0
 
+    private val hasRefreshSeed = !refreshSeed.isNullOrBlank()
+
     init {
-        tokenStore.load()?.let { tokens ->
-            accessToken = tokens.accessToken
-            refreshToken = tokens.refreshToken
-            userId = tokens.userId
-            expiresAt = tokens.expiresAt
+        val stored = tokenStore.load()
+        if (stored != null) {
+            accessToken = stored.accessToken
+            refreshToken = stored.refreshToken
+            userId = stored.userId
+            expiresAt = stored.expiresAt
+        } else {
+            // A refresh token pasted from the web session avoids the login captcha entirely.
+            refreshToken = refreshSeed?.takeIf { it.isNotBlank() }
         }
     }
 
@@ -330,6 +337,15 @@ internal class PikPakClient(
         if (!forceRefresh && accessToken != null && now < expiresAt - 600) return
 
         if (refreshLocked()) return
+
+        if (hasRefreshSeed) {
+            throw IOException(
+                "PikPak needs a fresh refresh token: the saved one is invalid or expired. " +
+                    "Log in at mypikpak.com, open the browser dev tools (F12) and copy the refresh token " +
+                    "from the 'credentials' cookie into the extension settings.",
+            )
+        }
+
         signInLocked()
     }
 
@@ -355,8 +371,10 @@ internal class PikPakClient(
                 Log.d(AUTH_TAG, "sign in ok attempt=$attempt")
                 return
             } catch (e: IOException) {
-                val retryable = e.message.orEmpty().contains("captcha", ignoreCase = true)
-                Log.d(AUTH_TAG, "sign in failed attempt=$attempt retryable=$retryable error=${e.message}")
+                val message = e.message.orEmpty()
+                val retryable = message.contains("captcha", ignoreCase = true) &&
+                    !message.contains("too frequent", ignoreCase = true)
+                Log.d(AUTH_TAG, "sign in failed attempt=$attempt retryable=$retryable error=$message")
                 if (!retryable) throw e
                 lastError = e
             }
@@ -495,6 +513,12 @@ internal class PikPakClient(
         ).use { response ->
             val body = response.body.string()
             if (!response.isSuccessful) {
+                if (response.code == 409 || body.contains("too frequent", ignoreCase = true)) {
+                    throw IOException(
+                        "PikPak is rate-limiting logins (\"Your operation is too frequent\"). " +
+                            "Wait a while, or paste a refresh token from the web version in the extension settings.",
+                    )
+                }
                 throw IOException("PikPak captcha HTTP ${response.code}: $body")
             }
 

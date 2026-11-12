@@ -26,6 +26,7 @@ import kotlinx.coroutines.coroutineScope
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -561,10 +562,35 @@ abstract class PikPak :
         val parts = account.split(':', limit = 2)
         if (parts.size < 2 || parts[1].isBlank()) return null
 
-        return PikPakClient(client, parts[0], parts[1], tokenStore()).also {
+        return PikPakClient(client, parts[0], parts[1], tokenStore(), refreshTokenSeed()).also {
             directClient = it
             directClientAccount = account
         }
+    }
+
+    private fun refreshTokenSeed(): String? {
+        val raw = preferences.getString(PREF_REFRESH_TOKEN_INPUT, "").orEmpty().trim()
+        if (raw.isBlank()) return null
+
+        val decoded = if (raw.contains('{') || raw.contains("%7B", ignoreCase = true) || raw.contains("refresh_token=", ignoreCase = true)) {
+            runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+        } else {
+            raw
+        }
+
+        REFRESH_TOKEN_JSON_REGEX.find(decoded)?.groupValues?.get(1)?.let { return it }
+
+        val tokenKey = "refresh_token="
+        val keyIndex = decoded.lowercase(Locale.US).indexOf(tokenKey)
+        if (keyIndex >= 0) {
+            return decoded.substring(keyIndex + tokenKey.length)
+                .substringBefore('&')
+                .substringBefore(';')
+                .trim('"', ' ', '\'')
+                .takeIf { it.isNotBlank() }
+        }
+
+        return decoded.takeIf { it.length >= 20 && !it.contains(' ') }
     }
 
     private fun tokenStore(): PikPakClient.TokenStore = object : PikPakClient.TokenStore {
@@ -817,7 +843,30 @@ abstract class PikPak :
                 directClient = null
                 directClientAccount = null
                 clearStoredTokens()
-                preferences.edit().putString(key, value).commit()
+                preferences.edit()
+                    .putString(key, value)
+                    .remove(PREF_REFRESH_TOKEN_INPUT)
+                    .commit()
+            }
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_REFRESH_TOKEN_INPUT
+            title = "PikPak refresh token (optional)"
+            summary = "Skips the login captcha. Copy it from mypikpak.com: F12 > Application > Cookies > credentials."
+            setDefaultValue("")
+            setOnBindEditTextListener { editText ->
+                editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit().putString(key, (newValue as String).trim()).commit()
+                catalogCache.clear()
+                libraryCache.clear()
+                extraFolderCache.clear()
+                clearStoredTokens()
+                directClient = null
+                directClientAccount = null
+                true
             }
         }.also(screen::addPreference)
 
@@ -905,9 +954,10 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v8"
+        private const val BUILD_TAG = "direct-v9"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
+        private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
         private const val PREF_EXTRA_FOLDERS = "pikpak_extra_folders"
         private const val PREF_ACCESS_TOKEN = "pikpak_access_token"
         private const val PREF_REFRESH_TOKEN = "pikpak_refresh_token"
@@ -981,5 +1031,7 @@ abstract class PikPak :
         private val DATE_FORMATTER = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
+
+        private val REFRESH_TOKEN_JSON_REGEX = Regex("\"refresh_token\"\\s*:\\s*\"([^\"]+)\"")
     }
 }
