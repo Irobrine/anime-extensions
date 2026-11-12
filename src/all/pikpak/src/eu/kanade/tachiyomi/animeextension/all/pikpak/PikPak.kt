@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.all.pikpak
 import android.text.InputType
 import android.util.Log
 import androidx.preference.EditTextPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakFile
@@ -889,6 +890,32 @@ abstract class PikPak :
     // ============================ Preferences =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        infoPreference(
+            screen,
+            "Folder structure",
+            "Each folder directly inside My Pack is one anime. Its sub-folders become seasons, " +
+                "and a folder without sub-folders shows its episodes directly.",
+        )
+        infoPreference(
+            screen,
+            "Season folders",
+            "Use names like \"Season 1\" or \"S01\" to get \"Anime S01\", or any label such as " +
+                "\"Dear Sister\" to get \"Anime Dear Sister\". Both are matched against the API separately.",
+        )
+        infoPreference(
+            screen,
+            "Episode files",
+            "Numbers in E09, \"- 09\", [09] or \"Episode 9\" are detected; files without a number are " +
+                "numbered in name order. Keep release group and quality tags out of anime folder names " +
+                "so the API match is accurate.",
+        )
+        infoPreference(
+            screen,
+            "Metadata",
+            "Anime folder names are matched against AniList for cover, studio, characters, " +
+                "recommendations and related entries. Add a TMDB API key for non-anime movies and TV.",
+        )
+
         EditTextPreference(screen.context).apply {
             key = PREF_ACCOUNT_KEY
             title = "PikPak account"
@@ -993,6 +1020,15 @@ abstract class PikPak :
         }.also(screen::addPreference)
     }
 
+    private fun infoPreference(screen: PreferenceScreen, infoTitle: String, infoSummary: String) {
+        Preference().apply {
+            title = infoTitle
+            summary = infoSummary
+            // Non-navigating info row; the stub Preference has no selectable flag.
+            setOnPreferenceClickListener { false }
+        }.also(screen::addPreference)
+    }
+
     private data class Library(
         val name: String,
         val entries: List<EpisodeEntry>,
@@ -1020,7 +1056,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v13"
+        private const val BUILD_TAG = "direct-v14"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
