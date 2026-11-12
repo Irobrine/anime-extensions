@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.pikpak
 
+import android.util.Log
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakAuthResponse
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakCaptchaMeta
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakCaptchaRequest
@@ -10,6 +11,7 @@ import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakMedia
 import eu.kanade.tachiyomi.animeextension.all.pikpak.dto.PikPakRefreshRequest
 import keiyoushi.network.get
 import keiyoushi.network.post
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
@@ -36,7 +38,24 @@ internal class PikPakClient(
     private val client: OkHttpClient,
     private val username: String,
     private val password: String,
+    private val tokenStore: TokenStore = NoOpTokenStore,
 ) {
+    interface TokenStore {
+        fun load(): StoredTokens?
+        fun save(tokens: StoredTokens)
+    }
+
+    data class StoredTokens(
+        val accessToken: String,
+        val refreshToken: String,
+        val userId: String,
+        val expiresAt: Long,
+    )
+
+    private object NoOpTokenStore : TokenStore {
+        override fun load(): StoredTokens? = null
+        override fun save(tokens: StoredTokens) = Unit
+    }
     data class Listing(
         val name: String,
         val rootId: String,
@@ -68,6 +87,23 @@ internal class PikPakClient(
 
     private var driveCaptcha: String? = null
     private var driveCaptchaExpiresAt: Long = 0
+
+    init {
+        tokenStore.load()?.let { tokens ->
+            accessToken = tokens.accessToken
+            refreshToken = tokens.refreshToken
+            userId = tokens.userId
+            expiresAt = tokens.expiresAt
+        }
+    }
+
+    private fun persistTokens() {
+        val access = accessToken ?: return
+        val refresh = refreshToken ?: return
+        runCatching {
+            tokenStore.save(StoredTokens(access, refresh, userId.orEmpty(), expiresAt))
+        }
+    }
 
     suspend fun listMyPack(): List<PikPakFile> = mutex.withLock {
         ensureAuthLocked()
@@ -268,6 +304,29 @@ internal class PikPakClient(
     }
 
     private suspend fun signInLocked() {
+        var lastError: Exception? = null
+        for (attempt in 1..MAX_SIGNIN_ATTEMPTS) {
+            if (attempt > 1) delay(SIGNIN_RETRY_DELAY_MS * attempt)
+            try {
+                signInOnceLocked()
+                Log.d(AUTH_TAG, "sign in ok attempt=$attempt")
+                return
+            } catch (e: IOException) {
+                val retryable = e.message.orEmpty().contains("captcha", ignoreCase = true)
+                Log.d(AUTH_TAG, "sign in failed attempt=$attempt retryable=$retryable error=${e.message}")
+                if (!retryable) throw e
+                lastError = e
+            }
+        }
+
+        throw IOException(
+            "PikPak rejected the sign-in captcha $MAX_SIGNIN_ATTEMPTS times. " +
+                "Wait a minute and try again, then check the account in the extension settings.",
+            lastError,
+        )
+    }
+
+    private suspend fun signInOnceLocked() {
         val captcha = initCaptchaLocked(
             action = LOGIN_CAPTCHA_ACTION,
             loginIdentifier = username,
@@ -305,6 +364,7 @@ internal class PikPakClient(
             expiresAt = nowSeconds() + data.expiresIn
             driveCaptcha = null
             driveCaptchaExpiresAt = 0
+            persistTokens()
         }
     }
 
@@ -338,6 +398,7 @@ internal class PikPakClient(
                     driveCaptchaExpiresAt = 0
                 }
                 expiresAt = nowSeconds() + data.expiresIn
+                persistTokens()
                 return true
             }
     }
@@ -427,6 +488,9 @@ internal class PikPakClient(
         private const val CLIENT_VERSION = "1.47.1"
         private const val PACKAGE_NAME = "com.pikcloud.pikpak"
         private const val SDK_VERSION = "2.0.4.204000"
+        private const val AUTH_TAG = "PikPakAuth"
+        private const val MAX_SIGNIN_ATTEMPTS = 3
+        private const val SIGNIN_RETRY_DELAY_MS = 3_000L
 
         private const val KIND_FOLDER = "drive#folder"
         private const val PHASE_COMPLETE = "PHASE_TYPE_COMPLETE"

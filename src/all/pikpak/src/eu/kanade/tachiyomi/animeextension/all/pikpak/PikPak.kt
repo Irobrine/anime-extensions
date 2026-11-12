@@ -516,10 +516,43 @@ abstract class PikPak :
         val parts = account.split(':', limit = 2)
         if (parts.size < 2 || parts[1].isBlank()) return null
 
-        return PikPakClient(client, parts[0], parts[1]).also {
+        return PikPakClient(client, parts[0], parts[1], tokenStore()).also {
             directClient = it
             directClientAccount = account
         }
+    }
+
+    private fun tokenStore(): PikPakClient.TokenStore = object : PikPakClient.TokenStore {
+        override fun load(): PikPakClient.StoredTokens? {
+            val access = preferences.getString(PREF_ACCESS_TOKEN, "").orEmpty()
+            val refresh = preferences.getString(PREF_REFRESH_TOKEN, "").orEmpty()
+            if (access.isBlank() || refresh.isBlank()) return null
+
+            return PikPakClient.StoredTokens(
+                accessToken = access,
+                refreshToken = refresh,
+                userId = preferences.getString(PREF_USER_ID, "").orEmpty(),
+                expiresAt = preferences.getLong(PREF_TOKEN_EXPIRES_AT, 0L),
+            )
+        }
+
+        override fun save(tokens: PikPakClient.StoredTokens) {
+            preferences.edit()
+                .putString(PREF_ACCESS_TOKEN, tokens.accessToken)
+                .putString(PREF_REFRESH_TOKEN, tokens.refreshToken)
+                .putString(PREF_USER_ID, tokens.userId)
+                .putLong(PREF_TOKEN_EXPIRES_AT, tokens.expiresAt)
+                .commit()
+        }
+    }
+
+    private fun clearStoredTokens() {
+        preferences.edit()
+            .remove(PREF_ACCESS_TOKEN)
+            .remove(PREF_REFRESH_TOKEN)
+            .remove(PREF_USER_ID)
+            .remove(PREF_TOKEN_EXPIRES_AT)
+            .commit()
     }
 
     private fun account(): String = preferences.getString(PREF_ACCOUNT_KEY, null)
@@ -732,6 +765,7 @@ abstract class PikPak :
                 libraryCache.clear()
                 directClient = null
                 directClientAccount = null
+                clearStoredTokens()
                 preferences.edit().putString(key, value).commit()
             }
         }.also(screen::addPreference)
@@ -796,9 +830,13 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v5"
+        private const val BUILD_TAG = "direct-v6"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
+        private const val PREF_ACCESS_TOKEN = "pikpak_access_token"
+        private const val PREF_REFRESH_TOKEN = "pikpak_refresh_token"
+        private const val PREF_USER_ID = "pikpak_user_id"
+        private const val PREF_TOKEN_EXPIRES_AT = "pikpak_token_expires_at"
         private const val PREF_TORRENTS_KEY = "show_torrents"
         private const val PREF_WEB_DOWNLOADS_KEY = "show_web_downloads"
         private const val PREF_METADATA_KEY = "fetch_metadata"
