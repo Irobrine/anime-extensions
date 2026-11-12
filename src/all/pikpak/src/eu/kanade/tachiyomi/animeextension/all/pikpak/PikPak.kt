@@ -23,6 +23,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
@@ -51,6 +53,7 @@ abstract class PikPak :
     private val libraryCache = ConcurrentHashMap<String, Pair<Library, Long>>()
     private val catalogCache = ConcurrentHashMap<String, Pair<List<CatalogItem>, Long>>()
     private val extraFolderCache = ConcurrentHashMap<String, Pair<List<CatalogItem>?, Long>>()
+    private val seasonProbeCache = ConcurrentHashMap<String, Pair<Boolean, Long>>()
 
     @Volatile
     private var directClientAccount: String? = null
@@ -360,16 +363,33 @@ abstract class PikPak :
         }
     }
 
-    private fun catalogPage(items: List<CatalogItem>, page: Int): AnimesPage {
+    private suspend fun catalogPage(items: List<CatalogItem>, page: Int): AnimesPage {
         val start = (page - 1) * PAGE_SIZE
         if (start >= items.size) return AnimesPage(emptyList(), false)
 
         val end = minOf(start + PAGE_SIZE, items.size)
-        val animes = items.subList(start, end).map { item ->
+        val pageItems = items.subList(start, end)
+
+        val client = directClient()
+        val foldersWithChildren = if (client == null) {
+            emptyMap()
+        } else {
+            val semaphore = Semaphore(FOLDER_PROBE_CONCURRENCY)
+            coroutineScope {
+                pageItems.filter { it.isFolder }.map { item ->
+                    async {
+                        item.id to semaphore.withPermit { folderHasSubfolders(client, item.id) }
+                    }
+                }.awaitAll().toMap()
+            }
+        }
+
+        val animes = pageItems.map { item ->
+            val hasSeasons = item.isFolder && foldersWithChildren[item.id] != false
             SAnime.create().apply {
                 title = cleanAnimeName(item.name).ifBlank { item.id }
                 url = item.id
-                fetch_type = if (item.isFolder) FetchType.Seasons else FetchType.Episodes
+                fetch_type = if (hasSeasons) FetchType.Seasons else FetchType.Episodes
                 description = when {
                     item.isPinned -> "PikPak extra folder • $BUILD_TAG"
                     item.isTorrent -> "PikPak torrent • $BUILD_TAG"
@@ -380,6 +400,29 @@ abstract class PikPak :
         }
 
         return AnimesPage(animes, end < items.size)
+    }
+
+    /**
+     * A folder without sub-folders is a flat anime: show its episodes directly
+     * instead of a synthetic season. Probe failures fall back to the seasons screen.
+     */
+    private suspend fun folderHasSubfolders(client: PikPakClient, folderId: String): Boolean {
+        val now = System.currentTimeMillis()
+        seasonProbeCache[folderId]?.let { (has, expiresAt) ->
+            if (expiresAt > now) return has
+        }
+
+        val has = try {
+            client.listChildren(folderId).any { it.kind == KIND_FOLDER }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "season probe failed folder=$folderId error=${e.message}")
+            true
+        }
+
+        seasonProbeCache[folderId] = has to (now + SEASON_PROBE_CACHE_MS)
+        return has
     }
 
     // ============================== Library ===============================
@@ -859,6 +902,7 @@ abstract class PikPak :
                 catalogCache.clear()
                 libraryCache.clear()
                 extraFolderCache.clear()
+                seasonProbeCache.clear()
                 directClient = null
                 directClientAccount = null
                 clearStoredTokens()
@@ -882,6 +926,7 @@ abstract class PikPak :
                 catalogCache.clear()
                 libraryCache.clear()
                 extraFolderCache.clear()
+                seasonProbeCache.clear()
                 clearStoredTokens()
                 directClient = null
                 directClientAccount = null
@@ -919,6 +964,7 @@ abstract class PikPak :
                 catalogCache.clear()
                 libraryCache.clear()
                 extraFolderCache.clear()
+                seasonProbeCache.clear()
                 true
             }
         }.also(screen::addPreference)
@@ -974,7 +1020,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v12"
+        private const val BUILD_TAG = "direct-v13"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
@@ -1000,6 +1046,8 @@ abstract class PikPak :
         private const val LIBRARY_CACHE_MS = 2_000L
         private const val EXTRA_FOLDER_CACHE_MS = 10 * 60 * 1000L
         private const val EXTRA_FOLDER_MISS_MS = 60 * 1000L
+        private const val SEASON_PROBE_CACHE_MS = 30 * 60 * 1000L
+        private const val FOLDER_PROBE_CONCURRENCY = 6
         private const val PAGE_SIZE = 100
 
         private val CATALOG_COMPARATOR = compareBy<CatalogItem> { if (it.isPinned) 0 else 1 }
