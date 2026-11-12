@@ -112,9 +112,10 @@ abstract class PikPak :
         if (library.name.isNotBlank()) {
             anime.title = cleanAnimeName(library.name)
         }
-        val seasons = library.entries.mapNotNull { it.season }.distinct()
+        val seasons = orderedSeasons(library.entries)
         if (preferences.getBoolean(PREF_METADATA_KEY, true)) {
-            val metadata = fetchMetadata(library.name, season)
+            // The first season's cover represents the whole show.
+            val metadata = fetchMetadata(library.name, seasons.firstOrNull())
             if (metadata != null) applyMetadata(anime, metadata)
         }
         anime.initialized = true
@@ -132,10 +133,7 @@ abstract class PikPak :
         if (season != null) return emptyList()
 
         val library = libraryFor(itemId)
-        val seasons = library.entries
-            .mapNotNull { it.season }
-            .distinct()
-            .sortedWith(compareBy<String> { seasonSortKey(it) }.thenBy { it })
+        val seasons = orderedSeasons(library.entries)
         Log.d(TAG, "seasons item=$itemId seasons=$seasons")
         if (seasons.isEmpty()) {
             return listOf(
@@ -154,11 +152,12 @@ abstract class PikPak :
         }
 
         val metadataEnabled = preferences.getBoolean(PREF_METADATA_KEY, true)
+        val parentTitle = cleanAnimeName(library.name)
         return coroutineScope {
             seasons.map { label ->
                 async {
                     SAnime.create().apply {
-                        title = label
+                        title = seasonDisplayTitle(parentTitle, label)
                         url = "$itemId$SEASON_SEPARATOR$label"
                         season_number = seasonNumberFromLabel(label)
                         fetch_type = FetchType.Episodes
@@ -395,32 +394,62 @@ abstract class PikPak :
         val parent = cleanAnimeName(parentTitle)
         if (parent.isBlank()) return null
 
-        val query = metadataQuery(parent, season)
-        val tmdbSeason = season?.let { seasonNumberForTmdb(it) }
-        val metadata = metadataClient().fetch(query, tmdbSeason)
-            ?: if (season != null) metadataClient().fetch(parent, null) else null
-
-        Log.d(TAG, "metadata query=$query season=$season found=${metadata != null}")
-        return metadata
-    }
-
-    private fun metadataQuery(parent: String, season: String?): String {
-        if (season.isNullOrBlank() || season == SYNTHETIC_SEASON_ID) return parent
-
-        val label = cleanAnimeName(season).ifBlank { season }
-        val key = seasonSortKey(season)
-        val suffix = when {
-            season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true) -> "Special"
-            key == 0 -> "Season 0"
-            key != Int.MAX_VALUE -> "Season $key"
-            else -> label
+        val queries = metadataQueries(parent, season)
+        val tmdbSeason = season?.let { detectedSeasonNumber(it) }
+        queries.forEach { query ->
+            val metadata = metadataClient().fetch(query, tmdbSeason)
+            if (metadata != null) {
+                Log.d(TAG, "metadata query=$query season=$season found=true")
+                return metadata
+            }
         }
-        return "$parent $suffix"
+
+        Log.d(TAG, "metadata season=$season found=false tried=$queries")
+        return null
     }
 
-    private fun seasonNumberForTmdb(season: String): Int? {
-        val number = seasonSortKey(season)
-        return number.takeIf { it in 0..50 }
+    private fun metadataQueries(parent: String, season: String?): List<String> {
+        if (season.isNullOrBlank() || season == SYNTHETIC_SEASON_ID) return listOf(parent)
+
+        val number = detectedSeasonNumber(season)
+        val queries = mutableListOf<String>()
+        when {
+            isSpecialSeason(season) -> queries += "$parent Specials"
+            number == 0 -> queries += "$parent Season 0"
+            number != null -> {
+                queries += "$parent Season $number"
+                ordinalSeasonSuffix(number)?.let { queries += "$parent $it" }
+            }
+            else -> {
+                val label = cleanAnimeName(season).ifBlank { season }
+                queries += "$parent $label"
+                pluralVariant(label)?.let { queries += "$parent $it" }
+            }
+        }
+        // Last resort: the parent entry, which still gives a cover and description.
+        queries += parent
+        return queries.distinct()
+    }
+
+    private fun pluralVariant(label: String): String? {
+        if (label.isBlank() || !label.last().isLetter()) return null
+        return if (label.endsWith("s", ignoreCase = true)) {
+            label.dropLast(1).takeIf { it.isNotBlank() && !it.endsWith("s", ignoreCase = true) }
+        } else {
+            "${label}s"
+        }
+    }
+
+    private fun ordinalSeasonSuffix(number: Int): String? {
+        if (number < 2) return null
+        val suffix = when {
+            number % 100 in 11..13 -> "th"
+            number % 10 == 1 -> "st"
+            number % 10 == 2 -> "nd"
+            number % 10 == 3 -> "rd"
+            else -> "th"
+        }
+        return "$number$suffix Season"
     }
 
     private fun applyMetadata(anime: SAnime, metadata: AnimeMetadata) {
@@ -582,11 +611,37 @@ abstract class PikPak :
     }
 
     private fun seasonSortKey(season: String): Int {
-        if (season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true)) return 0
-        SEASON_NAME_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        SEASON_EPISODE_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-        SEASON_ONLY_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        if (isSpecialSeason(season)) return 0
+        detectedSeasonNumber(season)?.let { return it }
         return Int.MAX_VALUE
+    }
+
+    private fun detectedSeasonNumber(season: String): Int? {
+        SEASON_NAME_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        SEASON_ONLY_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        SEASON_EPISODE_REGEX.find(season)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
+        return null
+    }
+
+    private fun isSpecialSeason(season: String): Boolean = season.equals("SP", ignoreCase = true) || season.contains("special", ignoreCase = true)
+
+    private fun orderedSeasons(entries: List<EpisodeEntry>): List<String> {
+        val unique = entries.mapNotNull { it.season }.distinct()
+        val numbered = unique.filter { detectedSeasonNumber(it) != null }
+            .sortedBy { detectedSeasonNumber(it) ?: 0 }
+        val named = unique.filter { detectedSeasonNumber(it) == null && it != OTHER_SEASON }
+        val ordered = numbered + named
+        return if (unique.contains(OTHER_SEASON)) ordered + OTHER_SEASON else ordered
+    }
+
+    private fun seasonDisplayTitle(parent: String, label: String): String {
+        val base = parent.ifBlank { label }
+        val number = detectedSeasonNumber(label)
+        return when {
+            number != null -> "$base ${String.format(Locale.US, "S%02d", number)}"
+            isSpecialSeason(label) -> "$base Specials"
+            else -> "$base ${cleanAnimeName(label).ifBlank { label }}"
+        }
     }
 
     private fun seasonNumberFromLabel(season: String): Double {
@@ -741,7 +796,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v4"
+        private const val BUILD_TAG = "direct-v5"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_TORRENTS_KEY = "show_torrents"

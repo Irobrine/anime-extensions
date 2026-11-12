@@ -6,7 +6,7 @@ plugins {
 
 yuzono {
     name = "PikPak"
-    versionCode = 4
+    versionCode = 5
     contentWarning = ContentWarning.SAFE
     libVersion = "16"
 
