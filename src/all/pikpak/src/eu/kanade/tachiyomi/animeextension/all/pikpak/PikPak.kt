@@ -1,7 +1,17 @@
 package eu.kanade.tachiyomi.animeextension.all.pikpak
 
+import android.app.Activity
+import android.app.Dialog
+import android.content.Context
+import android.content.ContextWrapper
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.util.Log
+import android.view.ViewGroup
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
@@ -627,33 +637,35 @@ abstract class PikPak :
         val raw = preferences.getString(PREF_REFRESH_TOKEN_INPUT, "").orEmpty().trim()
         if (raw.isBlank()) return null
 
-        val decoded = if (raw.contains('{') || raw.contains("%7B", ignoreCase = true) || raw.contains("refresh_token=", ignoreCase = true)) {
-            runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
-        } else {
-            raw
-        }
-
-        val token = REFRESH_TOKEN_JSON_REGEX.find(decoded)?.groupValues?.get(1)
-            ?: run {
-                val tokenKey = "refresh_token="
-                val keyIndex = decoded.lowercase(Locale.US).indexOf(tokenKey)
-                if (keyIndex >= 0) {
-                    decoded.substring(keyIndex + tokenKey.length)
-                        .substringBefore('&')
-                        .substringBefore(';')
-                        .trim('"', ' ', '\'')
-                        .takeIf { it.isNotBlank() }
-                } else {
-                    decoded.takeIf { it.length >= 20 && !it.contains(' ') }
-                }
-            }
-
+        val token = parseRefreshToken(raw)
         if (token != null) {
             Log.d(TAG, "refresh token seed length=${token.length} prefix=${token.take(2)}")
         } else {
             Log.d(TAG, "refresh token seed could not be parsed length=${raw.length}")
         }
         return token
+    }
+
+    private fun parseRefreshToken(raw: String): String? {
+        val decoded = if (raw.contains('{') || raw.contains("%7B", ignoreCase = true) || raw.contains("refresh_token=", ignoreCase = true)) {
+            runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+        } else {
+            raw
+        }
+
+        REFRESH_TOKEN_JSON_REGEX.find(decoded)?.groupValues?.get(1)?.let { return it }
+
+        val tokenKey = "refresh_token="
+        val keyIndex = decoded.lowercase(Locale.US).indexOf(tokenKey)
+        if (keyIndex >= 0) {
+            return decoded.substring(keyIndex + tokenKey.length)
+                .substringBefore('&')
+                .substringBefore(';')
+                .trim('"', ' ', '\'')
+                .takeIf { it.isNotBlank() }
+        }
+
+        return decoded.takeIf { it.length >= 20 && !it.contains(' ') }
     }
 
     private fun tokenStore(): PikPakClient.TokenStore = object : PikPakClient.TokenStore {
@@ -970,10 +982,19 @@ abstract class PikPak :
             }
         }.also(screen::addPreference)
 
+        Preference().apply {
+            title = "Log in with PikPak (web)"
+            summary = "Opens the PikPak website, imports the session token, then manages refreshes automatically."
+            setOnPreferenceClickListener {
+                loginWithWebView(screen)
+                true
+            }
+        }.also(screen::addPreference)
+
         EditTextPreference(screen.context).apply {
             key = PREF_REFRESH_TOKEN_INPUT
             title = "PikPak refresh token (optional)"
-            summary = "Skips the login captcha. Copy refresh_token from mypikpak.com: F12 > Application > Local Storage > credentials."
+            summary = "Manual fallback. Copy refresh_token from mypikpak.com: F12 > Application > Local Storage > credentials."
             setDefaultValue("")
             setOnBindEditTextListener { editText ->
                 editText.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -1059,6 +1080,70 @@ abstract class PikPak :
         }.also(screen::addPreference)
     }
 
+    /**
+     * Logs in through PikPak's own website in a WebView and imports the session's
+     * refresh token. The WebView is destroyed afterwards, so nothing else rotates
+     * the token; the extension then refreshes it on its own.
+     */
+    private fun loginWithWebView(screen: PreferenceScreen) {
+        val activity = screen.context.findActivity()
+        if (activity == null) {
+            Toast.makeText(screen.context, "Could not open the PikPak login.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val webView = WebView(activity).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.databaseEnabled = true
+            settings.userAgentString = DESKTOP_UA
+            webViewClient = WebViewClient()
+        }
+
+        val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
+        dialog.setContentView(webView)
+        dialog.window?.setLayout(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+
+        val handler = Handler(Looper.getMainLooper())
+        val poll = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing) return
+                webView.evaluateJavascript(READ_CREDENTIALS_JS) { raw ->
+                    val credentials = decodeJavascriptString(raw)
+                    val token = credentials?.let { parseRefreshToken(it) }
+                    if (token == null) {
+                        handler.postDelayed(this, WEB_LOGIN_POLL_MS)
+                        return@evaluateJavascript
+                    }
+
+                    preferences.edit().putString(PREF_REFRESH_TOKEN_INPUT, token).commit()
+                    catalogCache.clear()
+                    libraryCache.clear()
+                    extraFolderCache.clear()
+                    seasonProbeCache.clear()
+                    clearStoredTokens()
+                    directClient = null
+                    directClientAccount = null
+                    Log.d(TAG, "web login imported tokenLen=${token.length}")
+                    Toast.makeText(activity, "PikPak login imported", Toast.LENGTH_SHORT).show()
+                    dialog.dismiss()
+                }
+            }
+        }
+
+        dialog.setOnDismissListener {
+            handler.removeCallbacksAndMessages(null)
+            webView.destroy()
+        }
+
+        dialog.show()
+        webView.loadUrl(WEB_LOGIN_URL)
+        handler.postDelayed(poll, WEB_LOGIN_POLL_MS)
+    }
+
     private data class Library(
         val name: String,
         val entries: List<EpisodeEntry>,
@@ -1086,7 +1171,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v16"
+        private const val BUILD_TAG = "direct-v17"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
@@ -1180,5 +1265,27 @@ abstract class PikPak :
             "multi", "multisub", "multi sub", "dual audio",
             "sub", "subs", "dub", "dubbed", "subbed", "english sub", "eng sub",
         )
+
+        private const val WEB_LOGIN_URL = "https://mypikpak.com/"
+        private const val WEB_LOGIN_POLL_MS = 1_500L
+        private const val READ_CREDENTIALS_JS =
+            "(function(){try{return localStorage.getItem('credentials')}catch(e){return null}})()"
+        private const val DESKTOP_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     }
+}
+
+private fun Context.findActivity(): Activity? {
+    var current: Context = this
+    while (current is ContextWrapper) {
+        if (current is Activity) return current
+        current = current.baseContext
+    }
+    return null
+}
+
+private fun decodeJavascriptString(raw: String?): String? {
+    if (raw.isNullOrBlank() || raw == "null") return null
+    return runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull()
 }
