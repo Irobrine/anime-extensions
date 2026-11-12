@@ -50,7 +50,7 @@ abstract class PikPak :
 
     private val libraryCache = ConcurrentHashMap<String, Pair<Library, Long>>()
     private val catalogCache = ConcurrentHashMap<String, Pair<List<CatalogItem>, Long>>()
-    private val extraFolderCache = ConcurrentHashMap<String, Pair<PikPakFile?, Long>>()
+    private val extraFolderCache = ConcurrentHashMap<String, Pair<List<CatalogItem>?, Long>>()
 
     @Volatile
     private var directClientAccount: String? = null
@@ -287,7 +287,9 @@ abstract class PikPak :
             throw IOException("Could not list PikPak My Pack: ${e.message}", e)
         }
 
-        val pinned = extras.mapNotNull { resolveExtraFolder(client, it) }.distinctBy { it.id }
+        val pinned = extras.flatMap { resolveExtraFolders(client, it) }
+            .distinctBy { it.id }
+            .mapIndexed { index, item -> item.copy(order = index) }
         val pinnedIds = pinned.map { it.id }.toSet()
         val combined = pinned + filterCatalog(items)
             .map { it.toCatalogItem() }
@@ -299,28 +301,37 @@ abstract class PikPak :
         return combined
     }
 
-    private suspend fun resolveExtraFolder(client: PikPakClient, input: String): CatalogItem? {
+    /**
+     * Expands a configured extra folder into the anime folders it contains, so the
+     * catalog lists those directly. A folder without sub-folders is kept as one entry.
+     */
+    private suspend fun resolveExtraFolders(client: PikPakClient, input: String): List<CatalogItem> {
         val now = System.currentTimeMillis()
-        extraFolderCache[input]?.let { (folder, expiresAt) ->
-            if (expiresAt > now) return folder?.toCatalogItem(pinned = true)
+        extraFolderCache[input]?.let { (items, expiresAt) ->
+            if (expiresAt > now) return items.orEmpty()
         }
 
-        val folder = try {
-            client.resolveFolder(input)
+        val items = try {
+            val folder = client.resolveFolder(input)
+            if (folder == null) {
+                emptyList()
+            } else {
+                val children = client.listChildren(folder.id)
+                    .filter { it.kind == KIND_FOLDER && it.id.isNotBlank() }
+                    .map { it.toCatalogItem(pinned = true) }
+                children.ifEmpty { listOf(folder.toCatalogItem(pinned = true)) }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.d(TAG, "extra folder '$input' error=${e.message}")
-            null
+            emptyList()
         }
 
-        extraFolderCache[input] = folder to (now + if (folder != null) EXTRA_FOLDER_CACHE_MS else EXTRA_FOLDER_MISS_MS)
-        if (folder != null) {
-            Log.d(TAG, "extra folder '$input' -> '${folder.name}' id=${folder.id}")
-        } else {
-            Log.d(TAG, "extra folder '$input' not found")
-        }
-        return folder?.toCatalogItem(pinned = true)
+        extraFolderCache[input] = items.ifEmpty { null } to
+            (now + if (items.isNotEmpty()) EXTRA_FOLDER_CACHE_MS else EXTRA_FOLDER_MISS_MS)
+        Log.d(TAG, "extra folder '$input' anime=${items.size}")
+        return items
     }
 
     private fun extraFolders(): List<String> = preferences.getString(PREF_EXTRA_FOLDERS, "")
@@ -901,7 +912,7 @@ abstract class PikPak :
         EditTextPreference(screen.context).apply {
             key = PREF_EXTRA_FOLDERS
             title = "Extra folders"
-            summary = "Folder IDs or paths to add to the catalog, separated by commas. Example: My Shared/Anime"
+            summary = "Anime folders inside these are listed at the top of the catalog. Folder IDs or paths, separated by commas. Example: My Shared/Anime"
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putString(key, (newValue as String).trim()).commit()
@@ -949,6 +960,7 @@ abstract class PikPak :
         val isPinned: Boolean = false,
         val createdTime: String? = null,
         val thumbnail: String? = null,
+        val order: Int = Int.MAX_VALUE,
     )
 
     private data class EpisodeEntry(
@@ -962,7 +974,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v11"
+        private const val BUILD_TAG = "direct-v12"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
@@ -991,6 +1003,7 @@ abstract class PikPak :
         private const val PAGE_SIZE = 100
 
         private val CATALOG_COMPARATOR = compareBy<CatalogItem> { if (it.isPinned) 0 else 1 }
+            .thenBy { it.order }
             .thenByDescending { it.createdTime.orEmpty() }
             .thenBy { it.name.lowercase(Locale.US) }
 

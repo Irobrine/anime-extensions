@@ -151,6 +151,13 @@ internal class PikPakClient(
         Listing(root.name, root.id, files)
     }
 
+    suspend fun listChildren(folderId: String): List<PikPakFile> = mutex.withLock {
+        ensureAuthLocked()
+        listChildrenLocked(folderId)
+            .filter { it.id.isNotBlank() && it.trashed != true }
+            .filter { it.phase == null || it.phase == PHASE_COMPLETE }
+    }
+
     suspend fun getStreamUrl(fileId: String): String? = mutex.withLock {
         ensureAuthLocked()
         val file = getFileLocked(fileId)
