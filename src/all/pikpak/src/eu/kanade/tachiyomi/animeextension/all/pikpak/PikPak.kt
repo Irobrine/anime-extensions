@@ -932,6 +932,17 @@ abstract class PikPak :
     // ============================ Preferences =============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_WEB_LOGIN_KEY
+            title = "Log in with PikPak (web)"
+            summary = "Tap here to open PikPak's website and import the session automatically."
+            setDefaultValue(false)
+            setOnPreferenceClickListener {
+                loginWithWebView(screen)
+                true
+            }
+        }.also(screen::addPreference)
+
         infoPreference(
             screen,
             "Folder structure",
@@ -979,15 +990,6 @@ abstract class PikPak :
                     .putString(key, value)
                     .remove(PREF_REFRESH_TOKEN_INPUT)
                     .commit()
-            }
-        }.also(screen::addPreference)
-
-        Preference().apply {
-            title = "Log in with PikPak (web)"
-            summary = "Opens the PikPak website, imports the session token, then manages refreshes automatically."
-            setOnPreferenceClickListener {
-                loginWithWebView(screen)
-                true
             }
         }.also(screen::addPreference)
 
@@ -1171,9 +1173,10 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v17"
+        private const val BUILD_TAG = "direct-v18"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
+        private const val PREF_WEB_LOGIN_KEY = "pikpak_web_login"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
         private const val PREF_EXTRA_FOLDERS = "pikpak_extra_folders"
         private const val PREF_ACCESS_TOKEN = "pikpak_access_token"
