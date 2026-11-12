@@ -492,7 +492,7 @@ abstract class PikPak :
     }
 
     private suspend fun fetchMetadata(parentTitle: String, season: String?): AnimeMetadata? {
-        val parent = cleanAnimeName(parentTitle)
+        val parent = metadataSearchTitle(parentTitle)
         if (parent.isBlank()) return null
 
         val queries = metadataQueries(parent, season)
@@ -522,7 +522,7 @@ abstract class PikPak :
                 ordinalSeasonSuffix(number)?.let { queries += "$parent $it" }
             }
             else -> {
-                val label = cleanAnimeName(season).ifBlank { season }
+                val label = metadataSearchTitle(season).ifBlank { cleanAnimeName(season) }
                 queries += "$parent $label"
                 pluralVariant(label)?.let { queries += "$parent $it" }
             }
@@ -864,6 +864,32 @@ abstract class PikPak :
         return parsed.takeIf { it > 0L } ?: 0L
     }
 
+    /**
+     * Title used for API lookups: drops release noise and years (e.g. "(2020)", "[TV]")
+     * that break AniList/TMDB matching, while the catalog keeps the original cleaned name.
+     */
+    private fun metadataSearchTitle(name: String): String {
+        var cleaned = cleanAnimeName(name)
+
+        cleaned = PAREN_TAG_REGEX.replace(cleaned) { match ->
+            if (isMetadataNoise(match.groupValues[1])) "" else match.value
+        }
+        cleaned = BRACKET_TAG_REGEX.replace(cleaned) { match ->
+            if (isMetadataNoise(match.groupValues[1])) "" else match.value
+        }
+
+        cleaned = WHITESPACE_REGEX.replace(cleaned, " ").trim(' ', '-', '_', '.', ',')
+        return cleaned.ifBlank { cleanAnimeName(name) }
+    }
+
+    private fun isMetadataNoise(content: String): Boolean {
+        val value = content.trim()
+        if (value.isBlank()) return true
+        if (YEAR_OR_RANGE_REGEX.matches(value)) return true
+        if (value.lowercase(Locale.US) in METADATA_NOISE_WORDS) return true
+        return isVideoTypeTag(value)
+    }
+
     private fun cleanAnimeName(name: String): String {
         if (name.isBlank()) return name
 
@@ -1060,7 +1086,7 @@ abstract class PikPak :
 
     companion object {
         private const val TAG = "PikPak"
-        private const val BUILD_TAG = "direct-v15"
+        private const val BUILD_TAG = "direct-v16"
 
         private const val PREF_ACCOUNT_KEY = "pikpak_account"
         private const val PREF_REFRESH_TOKEN_INPUT = "pikpak_refresh_token_input"
@@ -1142,5 +1168,17 @@ abstract class PikPak :
         }
 
         private val REFRESH_TOKEN_JSON_REGEX = Regex("\"refresh_token\"\\s*:\\s*\"([^\"]+)\"")
+
+        private val YEAR_OR_RANGE_REGEX = Regex(
+            "(?i)^(?:19|20)\\d{2}(?:\\s*[-~–—]\\s*(?:(?:19|20)\\d{2}|present|ongoing))?$",
+        )
+
+        private val METADATA_NOISE_WORDS = setOf(
+            "tv", "tv series", "series", "movie", "film", "ova", "ona", "special", "specials",
+            "complete", "batch", "uncensored", "uncut", "remaster", "remastered",
+            "bd", "dvd", "web", "webrip", "web-dl", "bluray", "blu-ray",
+            "multi", "multisub", "multi sub", "dual audio",
+            "sub", "subs", "dub", "dubbed", "subbed", "english sub", "eng sub",
+        )
     }
 }
